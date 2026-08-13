@@ -507,6 +507,8 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    float corner_smoothing;
+    uint pad;
 };
 
 struct QuadVertexOutput {
@@ -863,7 +865,7 @@ struct Shadow {
     Bounds element_bounds;
     Corners element_corner_radii;
     uint inset;
-    uint pad; // align to 8 bytes
+    float corner_smoothing;
 };
 
 struct ShadowVertexOutput {

@@ -33,6 +33,14 @@ pub trait Styled: Sized {
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
 
+    /// Sets the superellipse ("squircle") exponent used for this element's corners.
+    /// Values above 2.0 progressively flatten the corner curvature; 2.0 or below
+    /// renders standard circular corners.
+    fn corner_smoothing(mut self, exponent: f32) -> Self {
+        self.style().corner_smoothing = Some(exponent);
+        self
+    }
+
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn block(mut self) -> Self {

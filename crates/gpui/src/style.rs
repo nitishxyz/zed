@@ -288,6 +288,10 @@ pub struct Style {
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
+    /// Superellipse exponent for the corners of this element; values above 2.0
+    /// flatten the corner curvature into a "squircle". 2.0 or below is circular.
+    pub corner_smoothing: f32,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
@@ -708,7 +712,7 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows(bounds, corner_radii, self.corner_smoothing, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
@@ -734,10 +738,10 @@ impl Style {
                 Edges::default(),
                 border_color,
                 self.border_style,
-            ));
+            ).corner_smoothing(self.corner_smoothing));
         }
 
-        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_inset_shadows(bounds, corner_radii, self.corner_smoothing, &self.box_shadow);
 
         continuation(window, cx);
 
@@ -752,7 +756,7 @@ impl Style {
                 border_widths,
                 self.border_color.unwrap_or_default(),
                 self.border_style,
-            ));
+            ).corner_smoothing(self.corner_smoothing));
         }
 
         #[cfg(debug_assertions)]
@@ -805,6 +809,7 @@ impl Default for Style {
             border_color: None,
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
+            corner_smoothing: 0.0,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

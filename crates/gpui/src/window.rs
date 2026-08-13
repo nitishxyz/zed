@@ -4067,6 +4067,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4091,7 +4092,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                corner_smoothing,
             });
         }
     }
@@ -4103,6 +4104,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4136,7 +4138,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                corner_smoothing,
             });
         }
     }
@@ -4204,6 +4206,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            corner_smoothing: quad.corner_smoothing,
+            pad: 0,
         };
 
         if !quad.background.is_transparent() {
@@ -6869,6 +6873,8 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// Superellipse exponent for the quad's corners; values <= 2.0 are circular.
+    pub corner_smoothing: f32,
 }
 
 impl PaintQuad {
@@ -6876,6 +6882,15 @@ impl PaintQuad {
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
             corner_radii: corner_radii.into(),
+            ..self
+        }
+    }
+
+    /// Sets the superellipse exponent for the quad's corners.
+    /// Values above 2.0 flatten the corner curvature into a "squircle"; 2.0 or below is circular.
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
+        PaintQuad {
+            corner_smoothing,
             ..self
         }
     }
@@ -6921,6 +6936,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.0,
     }
 }
 
@@ -6933,6 +6949,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        corner_smoothing: 0.0,
     }
 }
 
@@ -6949,6 +6966,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.0,
     }
 }
 

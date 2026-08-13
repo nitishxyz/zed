@@ -541,6 +541,9 @@ pub struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    /// Superellipse exponent for the corners; values <= 2 render circular corners.
+    pub corner_smoothing: f32,
+    pub pad: u32, // align to 8 bytes
 }
 
 impl From<Quad> for Primitive {
@@ -582,7 +585,8 @@ pub struct Shadow {
     pub element_corner_radii: Corners<ScaledPixels>,
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
-    pub pad: u32, // align to 8 bytes
+    /// Superellipse exponent for the corners; values <= 2 render circular corners.
+    pub corner_smoothing: f32,
 }
 
 impl From<Shadow> for Primitive {
