@@ -2726,17 +2726,31 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
-            window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
-                let was_hovered = hover_state
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().element);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().element = hovered;
-                        cx.notify(current_view);
+            let update_element_hover = Rc::new(
+                move |phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                    let hovered = hitbox.is_hovered(window);
+                    let was_hovered = hover_state
+                        .as_ref()
+                        .is_some_and(|state| state.borrow().element);
+                    if phase == DispatchPhase::Capture && hovered != was_hovered {
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().element = hovered;
+                            cx.notify(current_view);
+                        }
                     }
+                },
+            );
+
+            window.on_mouse_event({
+                let update_element_hover = update_element_hover.clone();
+                move |_: &MouseMoveEvent, phase, window, cx| {
+                    update_element_hover(phase, window, cx);
                 }
+            });
+            // The pointer can leave the window without a final move inside it,
+            // so the exit event is what ends hover in that case.
+            window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                update_element_hover(phase, window, cx);
             });
         }
 
@@ -2748,17 +2762,29 @@ impl Interactivity {
                     .cloned();
                 let current_view = window.current_view();
 
-                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                    let group_hovered = group_hitbox_id.is_hovered(window);
-                    let was_group_hovered = hover_state
-                        .as_ref()
-                        .is_some_and(|state| state.borrow().group);
-                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
-                        if let Some(hover_state) = &hover_state {
-                            hover_state.borrow_mut().group = group_hovered;
-                            cx.notify(current_view);
+                let update_group_hover = Rc::new(
+                    move |phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+                        let group_hovered = group_hitbox_id.is_hovered(window);
+                        let was_group_hovered = hover_state
+                            .as_ref()
+                            .is_some_and(|state| state.borrow().group);
+                        if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
+                            if let Some(hover_state) = &hover_state {
+                                hover_state.borrow_mut().group = group_hovered;
+                                cx.notify(current_view);
+                            }
                         }
+                    },
+                );
+
+                window.on_mouse_event({
+                    let update_group_hover = update_group_hover.clone();
+                    move |_: &MouseMoveEvent, phase, window, cx| {
+                        update_group_hover(phase, window, cx);
                     }
+                });
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+                    update_group_hover(phase, window, cx);
                 });
             }
         }
@@ -4343,6 +4369,40 @@ mod tests {
         assert_eq!(render_count.get(), initial_render_count + 2);
         assert_eq!(anonymous_paint_count.get(), 1);
         assert_eq!(stateful_width.get(), px(10.));
+    }
+
+    #[gpui::test]
+    fn hover_styles_clear_when_the_pointer_leaves_the_window(cx: &mut TestAppContext) {
+        let render_count = Rc::new(Cell::new(0));
+        let anonymous_paint_count = Rc::new(Cell::new(0));
+        let stateful_width = Rc::new(Cell::new(px(0.)));
+        let window = cx.add_window({
+            let render_count = render_count.clone();
+            let anonymous_paint_count = anonymous_paint_count.clone();
+            let stateful_width = stateful_width.clone();
+            move |_, _| GroupHoverTestView {
+                render_count,
+                anonymous_paint_count,
+                stateful_width,
+            }
+        });
+        let window = AnyWindowHandle::from(window);
+
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        cx.update_window(window, |_, window, cx| {
+            window.simulate_mouse_move(point(px(25.), px(25.)), cx)
+        })
+        .unwrap();
+        assert_eq!(stateful_width.get(), px(20.));
+
+        // The pointer leaves without a final move inside the window, which is
+        // all the platform reports; hover must still end.
+        cx.update_window(window, |_, window, cx| window.simulate_mouse_exit(cx))
+            .unwrap();
+        assert_eq!(stateful_width.get(), px(10.));
+        assert_eq!(anonymous_paint_count.get(), 1);
     }
 
     struct HoverListenerLayoutTestView {

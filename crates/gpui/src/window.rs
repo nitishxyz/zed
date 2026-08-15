@@ -1147,6 +1147,11 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// False between a `MouseExited` and the next positional mouse event. The
+    /// pointer can leave without a final move inside the window, so hit
+    /// testing has to be suppressed explicitly or hover styles latch onto
+    /// whatever the pointer was over when it left.
+    mouse_within_window: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2007,6 +2012,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            mouse_within_window: true,
             modifiers,
             capslock,
             scale_factor,
@@ -3238,7 +3244,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.hit_test_at_mouse(&self.next_frame);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -5128,16 +5134,19 @@ impl Window {
             PlatformInput::MouseMove(mouse_move) => {
                 self.mouse_position = mouse_move.position;
                 self.modifiers = mouse_move.modifiers;
+                self.mouse_within_window = true;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
                 self.mouse_position = mouse_down.position;
                 self.modifiers = mouse_down.modifiers;
+                self.mouse_within_window = true;
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
                 self.mouse_position = mouse_up.position;
                 self.modifiers = mouse_up.modifiers;
+                self.mouse_within_window = true;
                 PlatformInput::MouseUp(mouse_up)
             }
             PlatformInput::MousePressure(mouse_pressure) => {
@@ -5145,6 +5154,7 @@ impl Window {
             }
             PlatformInput::MouseExited(mouse_exited) => {
                 self.modifiers = mouse_exited.modifiers;
+                self.mouse_within_window = false;
                 PlatformInput::MouseExited(mouse_exited)
             }
             PlatformInput::ModifiersChanged(modifiers_changed) => {
@@ -5155,11 +5165,13 @@ impl Window {
             PlatformInput::ScrollWheel(scroll_wheel) => {
                 self.mouse_position = scroll_wheel.position;
                 self.modifiers = scroll_wheel.modifiers;
+                self.mouse_within_window = true;
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             PlatformInput::Pinch(pinch) => {
                 self.mouse_position = pinch.position;
                 self.modifiers = pinch.modifiers;
+                self.mouse_within_window = true;
                 PlatformInput::Pinch(pinch)
             }
             // Translate dragging and dropping of external files from the operating system
@@ -5274,8 +5286,20 @@ impl Window {
         }
     }
 
+    /// Hit test at the current mouse position, empty while the pointer is
+    /// outside the window. A pointer that leaves the window sends no further
+    /// moves, so without this the last position keeps testing as a hit and
+    /// hover styles stay stuck on.
+    fn hit_test_at_mouse(&self, frame: &Frame) -> HitTest {
+        if self.mouse_within_window {
+            frame.hit_test(self.mouse_position)
+        } else {
+            HitTest::default()
+        }
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.hit_test_at_mouse(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -6450,6 +6474,19 @@ impl Window {
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
         let event = PlatformInput::MouseMove(MouseMoveEvent {
             position,
+            modifiers: self.modifiers,
+            pressed_button: None,
+        });
+        let _ = self.dispatch_event(event, cx);
+    }
+
+    /// For testing: simulate the pointer leaving the window, as the platform
+    /// reports it when the cursor crosses the window edge without a final
+    /// move inside.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_mouse_exit(&mut self, cx: &mut App) {
+        let event = PlatformInput::MouseExited(crate::MouseExitEvent {
+            position: self.mouse_position,
             modifiers: self.modifiers,
             pressed_button: None,
         });
