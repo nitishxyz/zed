@@ -2450,6 +2450,13 @@ impl App {
         self.active_drag.is_some()
     }
 
+    pub(crate) fn active_drag_is_platform_owned(&self) -> bool {
+        self.active_drag.is_some()
+            && self.platform_owned_drag.as_ref().is_some_and(|drag| {
+                matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+            })
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
@@ -2909,6 +2916,9 @@ pub struct AnyDrag {
     /// Resolves the payload to offer the platform if the drag leaves the window.
     /// Invoked at most once per drag gesture, at promotion time.
     pub external_payload_source: Option<ExternalDragPayloadSource>,
+
+    /// Whether this drag should be promoted to the platform as soon as it starts.
+    pub native_only: bool,
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is

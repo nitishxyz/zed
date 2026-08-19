@@ -17,14 +17,14 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
-    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
-    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    Display, Element, ElementId, EmptyView, Entity, EntityId, ExternalDragPayload,
+    ExternalDragPayloadSource, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior,
+    HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent,
+    KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
+    Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -607,10 +607,37 @@ impl Interactivity {
         );
         self.drag_listener = Some(DragListener {
             value: Arc::new(value),
-            render: Box::new(move |value, offset, window, cx| {
+            render: Some(Box::new(move |value, offset, window, cx| {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
-            }),
+            })),
             external_payload: None,
+            native_payload: None,
+        });
+    }
+
+    /// Starts a native-only drag after the pointer crosses the drag threshold. The resolver receives
+    /// the initial pointer offset relative to this element. Native-only drags use the platform drag
+    /// icon and do not construct or paint a local drag preview.
+    pub fn on_native_drag<T>(
+        &mut self,
+        value: T,
+        resolver: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Option<ExternalDragPayload>
+        + 'static,
+    ) where
+        Self: Sized,
+        T: 'static,
+    {
+        debug_assert!(
+            self.drag_listener.is_none(),
+            "calling on_drag or on_native_drag more than once on the same element is not supported"
+        );
+        self.drag_listener = Some(DragListener {
+            value: Arc::new(value),
+            render: None,
+            external_payload: None,
+            native_payload: Some(Box::new(move |value, offset, window, cx| {
+                resolver(value.downcast_ref::<T>()?, offset, window, cx)
+            })),
         });
     }
 
@@ -1569,6 +1596,23 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Starts a native-only drag after the pointer crosses the drag threshold. The resolver receives
+    /// the initial pointer offset relative to this element. Native-only drags use the platform drag
+    /// icon and do not construct or paint a local drag preview.
+    fn on_native_drag<T>(
+        mut self,
+        value: T,
+        resolver: impl Fn(&T, Point<Pixels>, &mut Window, &mut App) -> Option<ExternalDragPayload>
+        + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+        T: 'static,
+    {
+        self.interactivity().on_native_drag(value, resolver);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1656,12 +1700,18 @@ pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 
 
 pub(crate) struct DragListener {
     value: Arc<dyn Any>,
-    render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
+    render:
+        Option<Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>>,
     external_payload: Option<ExternalDragPayloadResolver>,
+    native_payload: Option<NativeDragPayloadResolver>,
 }
 
 type ExternalDragPayloadResolver =
     Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
+
+type NativeDragPayloadResolver = Box<
+    dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+>;
 
 type DropListener = Box<dyn Fn(&dyn Any, &mut Window, &mut App) + 'static>;
 
@@ -2881,27 +2931,40 @@ impl Interactivity {
                             && mouse_down.button == MouseButton::Left
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
-                            let cursor_offset = event.position - hitbox.origin;
-                            let drag = (listener.render)(
-                                listener.value.as_ref(),
-                                cursor_offset,
-                                window,
-                                cx,
-                            );
+                            let native_only = listener.native_payload.is_some();
+                            let cursor_offset = if native_only {
+                                mouse_down.position - hitbox.origin
+                            } else {
+                                event.position - hitbox.origin
+                            };
+                            let drag = if let Some(render) = listener.render {
+                                render(listener.value.as_ref(), cursor_offset, window, cx)
+                            } else {
+                                crate::AppContext::new(cx, |_| EmptyView).into()
+                            };
                             let external_payload_source =
-                                listener.external_payload.map(|external_payload| {
+                                if let Some(native_payload) = listener.native_payload {
                                     let value = listener.value.clone();
-                                    Box::new(move |window: &mut Window, cx: &mut App| {
-                                        external_payload(value.as_ref(), window, cx)
+                                    Some(Box::new(move |window: &mut Window, cx: &mut App| {
+                                        native_payload(value.as_ref(), cursor_offset, window, cx)
                                     })
-                                        as ExternalDragPayloadSource
-                                });
+                                        as ExternalDragPayloadSource)
+                                } else {
+                                    listener.external_payload.map(|external_payload| {
+                                        let value = listener.value.clone();
+                                        Box::new(move |window: &mut Window, cx: &mut App| {
+                                            external_payload(value.as_ref(), window, cx)
+                                        })
+                                            as ExternalDragPayloadSource
+                                    })
+                                };
                             cx.active_drag = Some(AnyDrag {
                                 view: drag,
                                 value: listener.value,
                                 cursor_offset,
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
+                                native_only,
                             });
                             pending_mouse_down.take();
                             window.refresh();

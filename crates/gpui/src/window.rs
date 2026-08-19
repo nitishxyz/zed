@@ -3249,6 +3249,7 @@ impl Window {
             element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
             prompt_element = Some(element);
             self.prompt = Some(prompt);
+        } else if cx.active_drag_is_platform_owned() {
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any_element();
             let offset = self.mouse_position() - active_drag.cursor_offset;
@@ -5203,6 +5204,7 @@ impl Window {
                             cursor_offset: position,
                             cursor_style: None,
                             external_payload_source: None,
+                            native_only: false,
                         });
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
@@ -5283,7 +5285,8 @@ impl Window {
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
-        if !should_promote_external_drag(event, self.viewport_size) {
+        let native_only = cx.active_drag.as_ref().is_some_and(|drag| drag.native_only);
+        if !native_only && !should_promote_external_drag(event, self.viewport_size) {
             return;
         }
         if !self.platform_window.can_start_external_drag() {
@@ -7287,6 +7290,34 @@ mod tests {
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
 
+    struct NativeFileDragView {
+        path: PathBuf,
+        observed_pickup_offsets: Rc<RefCell<Vec<Point<Pixels>>>>,
+        observed_drops: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    impl Render for NativeFileDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("native-file-drag")
+                .size_full()
+                .on_native_drag(self.path.clone(), {
+                    let observed_pickup_offsets = self.observed_pickup_offsets.clone();
+                    move |path: &PathBuf, pickup_offset, _, _| {
+                        observed_pickup_offsets.borrow_mut().push(pickup_offset);
+                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                            path.clone(),
+                            true,
+                        )])))
+                    }
+                })
+                .on_drop({
+                    let observed_drops = self.observed_drops.clone();
+                    move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
+                })
+        }
+    }
+
     struct FileDragView {
         path: PathBuf,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
@@ -7316,6 +7347,95 @@ mod tests {
                     move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
                 })
         }
+    }
+
+    #[gpui::test]
+    fn native_drag_starts_at_threshold_with_mouse_down_offset_and_restores_for_drop(
+        cx: &mut TestAppContext,
+    ) {
+        let path = PathBuf::from("/tmp/native-drag");
+        let observed_pickup_offsets = Rc::new(RefCell::new(Vec::new()));
+        let observed_drops = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.clone();
+                let observed_pickup_offsets = observed_pickup_offsets.clone();
+                let observed_drops = observed_drops.clone();
+                move |_, _| NativeFileDragView {
+                    path,
+                    observed_pickup_offsets,
+                    observed_drops,
+                }
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(20.), px(20.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed_pickup_offsets.borrow().as_slice(),
+            &[point(px(10.), px(10.))]
+        );
+        assert_eq!(
+            cx.test_window(window).external_drag_files(),
+            [(path.clone(), true)]
+        );
+
+        let reentry_position = point(px(30.), px(30.));
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: reentry_position,
+                    paths: ExternalPaths([path.clone()].into_iter().collect()),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.as_ref().is_some_and(|drag| {
+                drag.native_only && drag.value.downcast_ref::<PathBuf>() == Some(&path)
+            }));
+            assert!(cx.active_drag_is_platform_owned());
+            window.draw(cx).clear(cx);
+
+            window.dispatch_event(
+                FileDropEvent::Submit {
+                    position: reentry_position,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed_drops.borrow().as_slice(),
+            std::slice::from_ref(&path)
+        );
     }
 
     #[test]
