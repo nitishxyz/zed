@@ -2091,6 +2091,16 @@ impl ContentMask<Pixels> {
     }
 }
 
+fn should_promote_external_drag(event: &PlatformInput) -> bool {
+    matches!(
+        event,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            pressed_button: Some(MouseButton::Left),
+            ..
+        })
+    )
+}
+
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
@@ -5257,13 +5267,7 @@ impl Window {
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
-        let PlatformInput::MouseMove(mouse_move) = event else {
-            return;
-        };
-        if mouse_move.pressed_button != Some(MouseButton::Left) {
-            return;
-        }
-        if Bounds::new(Point::default(), self.viewport_size).contains(&mouse_move.position) {
+        if !should_promote_external_drag(event) {
             return;
         }
         if !self.platform_window.can_start_external_drag() {
@@ -7009,6 +7013,7 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
+    use super::should_promote_external_drag;
     use std::{
         cell::{Cell, RefCell},
         path::PathBuf,
@@ -7019,7 +7024,7 @@ mod tests {
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
+        MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
         StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
         WindowOptions, canvas, div, point, px, size,
     };
@@ -7297,8 +7302,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_drag_promotion_requires_left_button_move() {
+        let move_event = |pressed_button| {
+            MouseMoveEvent {
+                position: point(px(10.), px(10.)),
+                pressed_button,
+                modifiers: Default::default(),
+            }
+            .to_platform_input()
+        };
+
+        assert!(should_promote_external_drag(&move_event(Some(
+            MouseButton::Left
+        ))));
+        assert!(!should_promote_external_drag(&move_event(None)));
+        assert!(!should_promote_external_drag(&move_event(Some(
+            MouseButton::Right
+        ))));
+        assert!(!should_promote_external_drag(
+            &MouseUpEvent {
+                position: point(px(10.), px(10.)),
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input()
+        ));
+    }
+
     #[gpui::test]
-    fn file_drag_is_promoted_once_and_restored_in_source_window(cx: &mut TestAppContext) {
+    fn file_drag_is_promoted_on_first_move_and_restored_in_source_window(cx: &mut TestAppContext) {
         struct Drag {
             window: AnyWindowHandle,
             observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
@@ -7344,14 +7378,14 @@ mod tests {
                     .to_platform_input(),
                     cx,
                 );
-                assert!(cx.active_drag.is_some());
+                assert_eq!(cx.active_drag.is_some(), !platform_result);
             });
             assert!(
                 update_result.is_ok(),
                 "failed to start drag: {update_result:?}"
             );
 
-            assert!(cx.test_window(window).external_drag_files().is_empty());
+            assert!(!cx.test_window(window).external_drag_files().is_empty());
             Drag {
                 window,
                 observed_drag_moves,
@@ -7382,13 +7416,6 @@ mod tests {
             cx.test_window(successful.window).external_drag_files(),
             [(successful_path.clone(), true)]
         );
-        // Views must still see the move that leaves the window, otherwise they never learn to tear
-        // down the drag state they built up while the pointer was inside.
-        assert_eq!(
-            successful.observed_drag_moves.borrow().last(),
-            Some(&outside_position)
-        );
-
         let destination: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
         let reentry_position = point(px(30.), px(30.));
         let external_paths = || ExternalPaths([successful_path.clone()].into_iter().collect());

@@ -1,7 +1,12 @@
 use std::{
     cell::{RefCell, RefMut},
+    fs::{File, OpenOptions},
     hash::Hash,
-    os::fd::{AsRawFd, BorrowedFd},
+    io::Write,
+    os::{
+        fd::{AsFd, AsRawFd, BorrowedFd},
+        unix::fs::OpenOptionsExt,
+    },
     path::PathBuf,
     rc::{Rc, Weak},
     time::{Duration, Instant},
@@ -97,7 +102,7 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
     FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
+    MouseUpEvent, NativeDragVisual, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
@@ -375,6 +380,103 @@ pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
     bytes: Vec<u8>,
     window: WaylandWindowStatePtr,
+    icon: Option<ExternalDragIcon>,
+}
+
+struct ExternalDragIcon {
+    surface: wl_surface::WlSurface,
+    buffer: wl_buffer::WlBuffer,
+    pool: wl_shm_pool::WlShmPool,
+    viewport: Option<wp_viewport::WpViewport>,
+    _file: File,
+}
+
+impl ExternalDragIcon {
+    fn destroy(self) {
+        if let Some(viewport) = self.viewport {
+            viewport.destroy();
+        }
+        self.surface.destroy();
+        self.buffer.destroy();
+        self.pool.destroy();
+    }
+}
+
+fn create_external_drag_icon(
+    globals: &Globals,
+    visual: &NativeDragVisual,
+) -> anyhow::Result<ExternalDragIcon> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("XDG_RUNTIME_DIR is unavailable"))?;
+    let path = runtime_dir.join(format!("zed-drag-icon-{}", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    file.write_all(visual.bgra_pixels())?;
+    file.flush()?;
+
+    let physical_size = visual.physical_size();
+    let width = physical_size.width.0;
+    let height = physical_size.height.0;
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("drag icon stride overflow"))?;
+    let byte_len = stride
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("drag icon byte length overflow"))?;
+    let pool = globals
+        .shm
+        .create_pool(file.as_fd(), byte_len, &globals.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width,
+        height,
+        stride,
+        wl_shm::Format::Argb8888,
+        &globals.qh,
+        (),
+    );
+    let surface = globals.compositor.create_surface(&globals.qh, ());
+
+    let (effective_scale, viewport) = if let Some(viewporter) = globals.viewporter.as_ref() {
+        (
+            visual.scale(),
+            Some(viewporter.get_viewport(&surface, &globals.qh, ())),
+        )
+    } else {
+        let buffer_scale = visual.scale().round().max(1.) as i32;
+        surface.set_buffer_scale(buffer_scale);
+        (buffer_scale as f32, None)
+    };
+    let logical_width = ((width as f32 / effective_scale).round() as i32).max(1);
+    let logical_height = ((height as f32 / effective_scale).round() as i32).max(1);
+    let hotspot = visual.hotspot();
+    let hotspot_x = (hotspot.x.0 as f32 / effective_scale).round() as i32;
+    let hotspot_y = (hotspot.y.0 as f32 / effective_scale).round() as i32;
+    if let Some(viewport) = viewport.as_ref() {
+        viewport.set_destination(logical_width, logical_height);
+    }
+    if surface.version() >= wl_surface::REQ_OFFSET_SINCE {
+        surface.attach(Some(&buffer), 0, 0);
+        surface.offset(-hotspot_x, -hotspot_y);
+    } else {
+        surface.attach(Some(&buffer), -hotspot_x, -hotspot_y);
+    }
+    surface.damage(0, 0, logical_width, logical_height);
+    surface.commit();
+
+    Ok(ExternalDragIcon {
+        surface,
+        buffer,
+        pool,
+        viewport,
+        _file: file,
+    })
 }
 
 fn file_uri_list(paths: &FileDragPaths) -> String {
@@ -465,17 +567,34 @@ impl WaylandClientStatePtr {
             return false;
         }
 
+        let icon = match paths.native_visual() {
+            Some(visual) => match create_external_drag_icon(&state.globals, visual) {
+                Ok(icon) => Some(icon),
+                Err(error) => {
+                    log::warn!("failed to create Wayland external drag icon: {error:#}");
+                    return false;
+                }
+            },
+            None => None,
+        };
+
         let serial = state.serial_tracker.get(SerialKind::MousePress);
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
         source.set_actions(DndAction::Copy | DndAction::Move);
-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        data_device.start_drag(
+            Some(&source),
+            surface,
+            icon.as_ref().map(|icon| &icon.surface),
+            serial.as_raw(),
+        );
 
         state.external_drag = Some(ExternalDrag {
             source,
             bytes: uri_list.into_bytes(),
             window,
+            icon,
         });
         true
     }
@@ -2715,6 +2834,9 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                     return;
                 };
                 external_drag.source.destroy();
+                if let Some(icon) = external_drag.icon {
+                    icon.destroy();
+                }
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Ended);
                 drop(state);

@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
+    Bounds, Capslock, Context, DevicePixels, Empty, IntoElement, Keystroke, Modifiers, Pixels,
+    Point, Render, Size, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -691,8 +691,7 @@ impl ExternalPaths {
     }
 }
 
-/// Data offered to the platform when an internal drag leaves the window and is
-/// promoted to a native drag session.
+/// Data offered to the platform when an internal drag is promoted to a native drag session.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
@@ -702,17 +701,109 @@ pub enum ExternalDragPayload {
 /// Paths handed to the platform for a native file drag. Directory metadata is
 /// provided by the caller to avoid querying it when the platform drag starts.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+pub struct FileDragPaths {
+    entries: SmallVec<[(PathBuf, bool); 2]>,
+    native_visual: Option<NativeDragVisual>,
+}
+
+/// Pixels for a platform-native drag icon.
+///
+/// Pixel data is tightly packed BGRA8888 in row-major order. The size and hotspot are in
+/// physical pixels, while `scale` is the number of physical pixels per logical pixel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeDragVisual {
+    bgra_pixels: Vec<u8>,
+    physical_size: Size<DevicePixels>,
+    scale: f32,
+    hotspot: Point<DevicePixels>,
+}
+
+// Construction rejects NaN scales, so equality is reflexive.
+impl Eq for NativeDragVisual {}
+
+impl NativeDragVisual {
+    /// Creates a validated native drag visual, or returns `None` for invalid dimensions, scale,
+    /// hotspot, or pixel data length.
+    pub fn new(
+        bgra_pixels: Vec<u8>,
+        physical_size: Size<DevicePixels>,
+        scale: f32,
+        hotspot: Point<DevicePixels>,
+    ) -> Option<Self> {
+        let width = physical_size.width.0;
+        let height = physical_size.height.0;
+        if width <= 0
+            || height <= 0
+            || !scale.is_finite()
+            || scale <= 0.
+            || hotspot.x.0 < 0
+            || hotspot.y.0 < 0
+            || hotspot.x.0 >= width
+            || hotspot.y.0 >= height
+        {
+            return None;
+        }
+
+        let byte_len = usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(4)?;
+        if bgra_pixels.len() != byte_len {
+            return None;
+        }
+
+        Some(Self {
+            bgra_pixels,
+            physical_size,
+            scale,
+            hotspot,
+        })
+    }
+
+    /// Tightly packed BGRA8888 pixel data.
+    pub fn bgra_pixels(&self) -> &[u8] {
+        &self.bgra_pixels
+    }
+
+    /// Width and height of the pixel buffer in physical pixels.
+    pub fn physical_size(&self) -> Size<DevicePixels> {
+        self.physical_size
+    }
+
+    /// Number of physical pixels per logical pixel.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Pointer hotspot in physical pixels from the visual's top-left corner.
+    pub fn hotspot(&self) -> Point<DevicePixels> {
+        self.hotspot
+    }
+}
 
 impl FileDragPaths {
     /// Creates a native file-drag payload from paths paired with whether each path is a directory.
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
-        Self(entries.into_iter().collect())
+        Self {
+            entries: entries.into_iter().collect(),
+            native_visual: None,
+        }
+    }
+
+    /// Adds a visual for platforms that support native drag icons.
+    pub fn with_native_visual(mut self, visual: NativeDragVisual) -> Self {
+        self.native_visual = Some(visual);
+        self
     }
 
     /// The dragged paths, each paired with whether it is a directory.
     pub fn entries(&self) -> &[(PathBuf, bool)] {
-        &self.0
+        &self.entries
+    }
+
+    /// The optional platform-native drag visual.
+    pub fn native_visual(&self) -> Option<&NativeDragVisual> {
+        self.native_visual.as_ref()
     }
 }
 
@@ -832,6 +923,58 @@ impl PlatformInput {
 
 #[cfg(test)]
 mod test {
+    use super::{FileDragPaths, NativeDragVisual};
+    use crate::{DevicePixels, point, size};
+    use std::path::PathBuf;
+
+    #[test]
+    fn native_drag_visual_validates_and_attaches_to_file_paths() {
+        let visual = NativeDragVisual::new(
+            vec![255; 2 * 3 * 4],
+            size(DevicePixels(2), DevicePixels(3)),
+            2.,
+            point(DevicePixels(1), DevicePixels(2)),
+        )
+        .expect("valid drag visual");
+        let paths = FileDragPaths::new([(PathBuf::from("/tmp/file"), false)])
+            .with_native_visual(visual.clone());
+
+        assert_eq!(paths.native_visual(), Some(&visual));
+        assert_eq!(visual.bgra_pixels().len(), 24);
+        assert_eq!(
+            visual.physical_size(),
+            size(DevicePixels(2), DevicePixels(3))
+        );
+        assert_eq!(visual.scale(), 2.);
+        assert_eq!(visual.hotspot(), point(DevicePixels(1), DevicePixels(2)));
+    }
+
+    #[test]
+    fn native_drag_visual_rejects_invalid_input() {
+        let valid_size = size(DevicePixels(2), DevicePixels(2));
+        let valid_hotspot = point(DevicePixels(0), DevicePixels(0));
+
+        assert!(NativeDragVisual::new(vec![0; 15], valid_size, 1., valid_hotspot).is_none());
+        assert!(
+            NativeDragVisual::new(
+                vec![0; 16],
+                size(DevicePixels(0), DevicePixels(2)),
+                1.,
+                valid_hotspot,
+            )
+            .is_none()
+        );
+        assert!(NativeDragVisual::new(vec![0; 16], valid_size, 0., valid_hotspot).is_none());
+        assert!(
+            NativeDragVisual::new(
+                vec![0; 16],
+                valid_size,
+                1.,
+                point(DevicePixels(2), DevicePixels(0)),
+            )
+            .is_none()
+        );
+    }
 
     use crate::{
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
