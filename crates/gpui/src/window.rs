@@ -8,10 +8,10 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -2094,7 +2094,7 @@ impl ContentMask<Pixels> {
 fn should_promote_external_drag(event: &PlatformInput) -> bool {
     matches!(
         event,
-        PlatformInput::MouseMove(MouseMoveEvent {
+        PlatformInput::MouseExited(MouseExitEvent {
             pressed_button: Some(MouseButton::Left),
             ..
         })
@@ -5189,6 +5189,7 @@ impl Window {
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
+                    self.mouse_within_window = true;
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
                         cx.active_drag = Some(AnyDrag {
@@ -5207,6 +5208,7 @@ impl Window {
                 }
                 FileDropEvent::Pending { position } => {
                     self.mouse_position = position;
+                    self.mouse_within_window = true;
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
@@ -5216,6 +5218,7 @@ impl Window {
                 FileDropEvent::Submit { position } => {
                     cx.activate(true);
                     self.mouse_position = position;
+                    self.mouse_within_window = true;
                     PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
@@ -5240,15 +5243,15 @@ impl Window {
             PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
         };
 
+        // Mouse-exit listeners may clear the internal drag. Start the native session first so its
+        // payload is still available at the window boundary.
+        self.promote_external_drag_to_platform(&event, cx);
+
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
         }
-
-        // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
-        // is the last chance for drag listeners to see the pointer leave and reset their state.
-        self.promote_external_drag_to_platform(&event, cx);
 
         if self.invalidator.update_count() > update_count_before {
             self.input_rate_tracker.borrow_mut().record_input();
@@ -7024,9 +7027,9 @@ mod tests {
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+        RequestFrameOptions, StatefulInteractiveElement as _, Styled, TestAppContext, Window,
+        WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
 
     struct EmptyView;
@@ -7303,9 +7306,9 @@ mod tests {
     }
 
     #[test]
-    fn external_drag_promotion_requires_left_button_move() {
-        let move_event = |pressed_button| {
-            MouseMoveEvent {
+    fn external_drag_promotion_requires_left_button_exit() {
+        let exit_event = |pressed_button| {
+            MouseExitEvent {
                 position: point(px(10.), px(10.)),
                 pressed_button,
                 modifiers: Default::default(),
@@ -7313,13 +7316,21 @@ mod tests {
             .to_platform_input()
         };
 
-        assert!(should_promote_external_drag(&move_event(Some(
+        assert!(should_promote_external_drag(&exit_event(Some(
             MouseButton::Left
         ))));
-        assert!(!should_promote_external_drag(&move_event(None)));
-        assert!(!should_promote_external_drag(&move_event(Some(
+        assert!(!should_promote_external_drag(&exit_event(None)));
+        assert!(!should_promote_external_drag(&exit_event(Some(
             MouseButton::Right
         ))));
+        assert!(!should_promote_external_drag(
+            &MouseMoveEvent {
+                position: point(px(10.), px(10.)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input()
+        ));
         assert!(!should_promote_external_drag(
             &MouseUpEvent {
                 position: point(px(10.), px(10.)),
@@ -7332,7 +7343,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn file_drag_is_promoted_on_first_move_and_restored_in_source_window(cx: &mut TestAppContext) {
+    fn file_drag_is_promoted_on_exit_and_restored_in_source_window(cx: &mut TestAppContext) {
         struct Drag {
             window: AnyWindowHandle,
             observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
@@ -7378,14 +7389,14 @@ mod tests {
                     .to_platform_input(),
                     cx,
                 );
-                assert_eq!(cx.active_drag.is_some(), !platform_result);
+                assert!(cx.active_drag.is_some());
             });
             assert!(
                 update_result.is_ok(),
                 "failed to start drag: {update_result:?}"
             );
 
-            assert!(!cx.test_window(window).external_drag_files().is_empty());
+            assert!(cx.test_window(window).external_drag_files().is_empty());
             Drag {
                 window,
                 observed_drag_moves,
@@ -7398,7 +7409,7 @@ mod tests {
         let outside_position = point(px(-1.), px(20.));
         let update_result = cx.update_window(successful.window, |_, window, cx| {
             window.dispatch_event(
-                MouseMoveEvent {
+                MouseExitEvent {
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -7519,7 +7530,7 @@ mod tests {
         let cancelled = start_drag(cx, cancelled_path.clone(), true);
         let update_result = cx.update_window(cancelled.window, |_, window, cx| {
             window.dispatch_event(
-                MouseMoveEvent {
+                MouseExitEvent {
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -7556,7 +7567,7 @@ mod tests {
         let removed_window_id = removed.window.window_id();
         let update_result = cx.update_window(removed.window, |_, window, cx| {
             window.dispatch_event(
-                MouseMoveEvent {
+                MouseExitEvent {
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
@@ -7576,17 +7587,15 @@ mod tests {
         let failed_path = PathBuf::from("/tmp/failed-drag");
         let failed = start_drag(cx, failed_path.clone(), false);
         let update_result = cx.update_window(failed.window, |_, window, cx| {
-            for x_position in [-1., -2.] {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(x_position), px(20.)),
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            }
+            window.dispatch_event(
+                MouseExitEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
             assert!(cx.active_drag.is_some());
         });
         assert!(
