@@ -2091,14 +2091,19 @@ impl ContentMask<Pixels> {
     }
 }
 
-fn should_promote_external_drag(event: &PlatformInput) -> bool {
-    matches!(
-        event,
+fn should_promote_external_drag(event: &PlatformInput, viewport_size: Size<Pixels>) -> bool {
+    match event {
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: Some(MouseButton::Left),
+            ..
+        }) => !Bounds::new(Point::default(), viewport_size).contains(position),
         PlatformInput::MouseExited(MouseExitEvent {
             pressed_button: Some(MouseButton::Left),
             ..
-        })
-    )
+        }) => true,
+        _ => false,
+    }
 }
 
 impl Window {
@@ -5245,12 +5250,20 @@ impl Window {
 
         // Mouse-exit listeners may clear the internal drag. Start the native session first so its
         // payload is still available at the window boundary.
-        self.promote_external_drag_to_platform(&event, cx);
+        if matches!(event, PlatformInput::MouseExited(_)) {
+            self.promote_external_drag_to_platform(&event, cx);
+        }
 
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
             self.dispatch_key_event(any_key_event, cx);
+        }
+
+        // Under a compositor pointer grab, movement continues outside the surface instead of
+        // producing MouseExited. Dispatch that final move before handing the gesture to the platform.
+        if matches!(event, PlatformInput::MouseMove(_)) {
+            self.promote_external_drag_to_platform(&event, cx);
         }
 
         if self.invalidator.update_count() > update_count_before {
@@ -5270,7 +5283,7 @@ impl Window {
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
-        if !should_promote_external_drag(event) {
+        if !should_promote_external_drag(event, self.viewport_size) {
             return;
         }
         if !self.platform_window.can_start_external_drag() {
@@ -7306,44 +7319,62 @@ mod tests {
     }
 
     #[test]
-    fn external_drag_promotion_requires_left_button_exit() {
+    fn external_drag_promotion_requires_left_button_at_window_boundary() {
+        let viewport_size = size(px(100.), px(100.));
+        let move_event = |position, pressed_button| {
+            MouseMoveEvent {
+                position,
+                pressed_button,
+                modifiers: Default::default(),
+            }
+            .to_platform_input()
+        };
         let exit_event = |pressed_button| {
             MouseExitEvent {
-                position: point(px(10.), px(10.)),
+                position: point(px(100.), px(10.)),
                 pressed_button,
                 modifiers: Default::default(),
             }
             .to_platform_input()
         };
 
-        assert!(should_promote_external_drag(&exit_event(Some(
-            MouseButton::Left
-        ))));
-        assert!(!should_promote_external_drag(&exit_event(None)));
-        assert!(!should_promote_external_drag(&exit_event(Some(
-            MouseButton::Right
-        ))));
         assert!(!should_promote_external_drag(
-            &MouseMoveEvent {
-                position: point(px(10.), px(10.)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Default::default(),
-            }
-            .to_platform_input()
+            &move_event(point(px(10.), px(10.)), Some(MouseButton::Left)),
+            viewport_size,
         ));
+        assert!(should_promote_external_drag(
+            &move_event(point(px(101.), px(10.)), Some(MouseButton::Left)),
+            viewport_size,
+        ));
+        assert!(should_promote_external_drag(
+            &exit_event(Some(MouseButton::Left)),
+            viewport_size,
+        ));
+
+        for pressed_button in [None, Some(MouseButton::Right)] {
+            assert!(!should_promote_external_drag(
+                &move_event(point(px(101.), px(10.)), pressed_button),
+                viewport_size,
+            ));
+            assert!(!should_promote_external_drag(
+                &exit_event(pressed_button),
+                viewport_size,
+            ));
+        }
         assert!(!should_promote_external_drag(
             &MouseUpEvent {
-                position: point(px(10.), px(10.)),
+                position: point(px(101.), px(10.)),
                 button: MouseButton::Left,
                 modifiers: Default::default(),
                 click_count: 1,
             }
-            .to_platform_input()
+            .to_platform_input(),
+            viewport_size,
         ));
     }
 
     #[gpui::test]
-    fn file_drag_is_promoted_on_exit_and_restored_in_source_window(cx: &mut TestAppContext) {
+    fn file_drag_is_promoted_at_boundary_and_restored_in_source_window(cx: &mut TestAppContext) {
         struct Drag {
             window: AnyWindowHandle,
             observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
@@ -7409,7 +7440,7 @@ mod tests {
         let outside_position = point(px(-1.), px(20.));
         let update_result = cx.update_window(successful.window, |_, window, cx| {
             window.dispatch_event(
-                MouseExitEvent {
+                MouseMoveEvent {
                     position: outside_position,
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
