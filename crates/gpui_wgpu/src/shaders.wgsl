@@ -733,10 +733,33 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // mirrored into bottom right quadrant.
     let corner_center_to_point = corner_to_point + corner_radius;
 
+    // Elongated capsule end caps reach (k - 1) * r into the straight run,
+    // so the curved neighborhood starts before corner_center_to_point
+    // crosses zero on the long axis. Without this the straight-border fast
+    // paths claim the cap extension zone: the background fast path paints
+    // fill outside the curve (the fill leaks toward the straight edge) and
+    // the inner-border fast path draws the hairline along the straight
+    // edge the curve has already left.
+    var cap_extension = vec2<f32>(0.0);
+    if (quad.corner_smoothing > 2.0) {
+        let inset_extent = half_size - corner_radius;
+        let x_degenerate = inset_extent.x <= 0.5;
+        let y_degenerate = inset_extent.y <= 0.5;
+        if (y_degenerate && !x_degenerate) {
+            let k = min(CAPSULE_CAP_STRETCH,
+                1.0 + inset_extent.x / max(corner_radius, 0.5));
+            cap_extension.x = (k - 1.0) * corner_radius;
+        } else if (x_degenerate && !y_degenerate) {
+            let k = min(CAPSULE_CAP_STRETCH,
+                1.0 + inset_extent.y / max(corner_radius, 0.5));
+            cap_extension.y = (k - 1.0) * corner_radius;
+        }
+    }
+
     // Whether the nearest point on the border is rounded
     let is_near_rounded_corner =
-            corner_center_to_point.x >= 0 &&
-            corner_center_to_point.y >= 0;
+            corner_center_to_point.x >= -cap_extension.x &&
+            corner_center_to_point.y >= -cap_extension.y;
 
     // Vector from straight border inner corner to point.
     let straight_border_inner_corner_to_point = corner_to_point + reduced_border;
@@ -776,7 +799,8 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     //   nearest-point-on-ellipse.
     // * When it is quickly known to be outside the edge, -1.0 is used.
     var inner_sdf = 0.0;
-    if (corner_center_to_point.x <= 0 || corner_center_to_point.y <= 0) {
+    if (corner_center_to_point.x <= -cap_extension.x ||
+        corner_center_to_point.y <= -cap_extension.y) {
         // Fast paths for straight borders.
         inner_sdf = -max(straight_border_inner_corner_to_point.x,
                          straight_border_inner_corner_to_point.y);
