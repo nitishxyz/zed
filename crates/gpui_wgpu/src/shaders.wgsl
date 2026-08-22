@@ -332,14 +332,28 @@ fn erf(v: vec2<f32>) -> vec2<f32> {
 
 fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>,
     corner_smoothing: f32) -> f32 {
-  let delta = min(half_size.y - corner - abs(y), 0.0);
+  let raw = half_size.y - corner - abs(y);
+  let delta = min(raw, 0.0);
   var chord = 0.0;
-  // Capsule ends blur with the circular chord: the G2 capsule's tip is
-  // exactly circular, and the exponent blend near the straight edges is
-  // invisible under gaussian blur, while the superellipse chord would
-  // square off the shadow's ends.
-  if (corner_smoothing <= 2.0 || half_size.y - corner <= 0.5) {
+  if (corner_smoothing <= 2.0) {
+    // Circular corner: circular chord.
     chord = sqrt(max(0.0, corner * corner - delta * delta));
+  } else if (half_size.y - corner <= 0.5) {
+    // Smoothed horizontal capsule: chord of the elongated end cap,
+    // approximated by the stretched ellipse (gaussian blur hides the
+    // exponent blend). See capsule_cap_sdf.
+    let k = min(CAPSULE_CAP_STRETCH,
+        1.0 + max(half_size.x - corner, 0.0) / max(corner, 0.5));
+    chord = k * sqrt(max(0.0, corner * corner - delta * delta))
+        - (k - 1.0) * corner;
+  } else if (half_size.x - corner <= 0.5) {
+    // Smoothed vertical capsule: the cap consumes `k * corner` of height;
+    // map the height offset into the stretched cap, then take the
+    // elliptical chord.
+    let k = min(CAPSULE_CAP_STRETCH,
+        1.0 + max(half_size.y - corner, 0.0) / max(corner, 0.5));
+    let w = max(((k - 1.0) * corner - raw) / k, 0.0);
+    chord = sqrt(max(0.0, corner * corner - w * w));
   } else {
     // Superellipse corner: |dx|^p + |dy|^p = r^p.
     chord = pow(max(0.0, pow(corner, corner_smoothing) -
@@ -359,38 +373,51 @@ fn lp_length(v: vec2<f32>, p: f32) -> f32 {
     return pow(pow(v.x, p) + pow(v.y, p), 1.0 / p);
 }
 
-// Resolves the corner exponent for one fragment of a smoothed quad.
+// How far a smoothed capsule's end cap extends along the pill's long axis,
+// in corner radii. The cap borrows this extra length from the straight run
+// (the pill's footprint is unchanged) so the curve can reach zero curvature
+// at the straight-edge join without hugging the edge. Must match the
+// compositor's mask shaders. See docs/continuous-capsule-plan.md in the
+// desktop-platform repo.
+const CAPSULE_CAP_STRETCH: f32 = 1.4;
+
+// Signed distance of a smoothed capsule's end cap.
 //
 // A pure superellipse cannot draw a capsule: at radius = half the short
 // side its pole flattens and the end reads squared-off, while a circular
 // arc joins the straight edge with a visible curvature jump (G1, not G2).
-// When the corner arc consumes the full short side (`inset_extent` is
-// degenerate on one axis), the exponent is blended by direction instead:
-// exactly 2 at the capsule's tip (a true circular end) rising to the full
-// smoothing exponent where the curve meets the straight edge, so curvature
-// reaches zero at the join. A quad that is degenerate on both axes is a
-// circle and stays circular; a quad with both extents keeps the ordinary
-// superellipse corner.
-fn resolve_corner_exponent(corner_center_to_point: vec2<f32>,
-    inset_extent: vec2<f32>, corner_smoothing: f32) -> f32 {
-    let eps = 0.5;
-    let x_degenerate = inset_extent.x <= eps;
-    let y_degenerate = inset_extent.y <= eps;
-    if (x_degenerate && y_degenerate) {
-        return 2.0;
+// Exponent blends confined to the circular cap's footprint fail too: any
+// curve reaching zero curvature inside the quarter-circle flattens against
+// the tip or the edge. So the cap borrows length from the straight run: an
+// Lp superellipse evaluated on coordinates compressed by `k` along the
+// long axis, exponent blended by direction from 2 at the tip (a stretched
+// elliptical bullet nose - a high exponent would flatten the pole) up to
+// `corner_smoothing` at the straight-edge join, where curvature reaches
+// zero (G2) over the full cap, the same way the ordinary superellipse
+// corners meet their edges.
+//
+// `cap` is `corner_center_to_point` oriented so x is the long axis;
+// `long_inset` is the straight run's half length. Pills shorter than two
+// full caps blend the stretch back toward 1 so a circle stays circular.
+//
+// Stretching the domain distorts the field's metric, so the result is
+// normalized by the gradient magnitude to keep antialiasing and border
+// widths uniform along the boundary.
+fn capsule_cap_sdf(cap: vec2<f32>, corner_radius: f32, corner_smoothing: f32,
+    long_inset: f32) -> f32 {
+    let k = min(CAPSULE_CAP_STRETCH,
+        1.0 + long_inset / max(corner_radius, 0.5));
+    let u = (cap.x + (k - 1.0) * corner_radius) / k;
+    if (u <= 0.0) {
+        // Straight-edge slab along the long run.
+        return max(cap.x, cap.y) - corner_radius;
     }
-    if (!x_degenerate && !y_degenerate) {
-        return corner_smoothing;
-    }
-    // Capsule: circular ends. Exponent-blend experiments that ramped the
-    // curve to zero curvature at the straight-edge join (G2) made the
-    // boundary hug the straight line over the last stretch of the arc,
-    // which antialiasing renders as a faint flat tail - the straight edge
-    // reads as detached from the arc at hairline scale. A truly
-    // continuous-curvature capsule needs a spline that borrows length
-    // from the straight edge, which an exponent field cannot express, so
-    // capsules keep the classical circular arc.
-    return 2.0;
+    let v = max(cap.y, 0.0);
+    let toward_join = v / max(length(vec2<f32>(u, v)), 1e-4);
+    let p = mix(2.0, corner_smoothing, toward_join);
+    let n = max(pow(pow(u, p) + pow(v, p), 1.0 / p), 1e-4);
+    let grad = vec2<f32>(pow(u / n, p - 1.0) / k, pow(v / n, p - 1.0));
+    return (n - corner_radius) / max(length(grad), 1e-4);
 }
 
 // Selects corner radius based on quadrant.
@@ -433,10 +460,25 @@ fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32,
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
-        var exponent = corner_smoothing;
         if (corner_smoothing > 2.0) {
-            exponent = resolve_corner_exponent(corner_center_to_point,
-                inset_extent, corner_smoothing);
+            let x_degenerate = inset_extent.x <= 0.5;
+            let y_degenerate = inset_extent.y <= 0.5;
+            if (x_degenerate != y_degenerate) {
+                // Capsule: the corner arc consumes the full short side;
+                // draw the elongated end cap instead of a corner.
+                if (y_degenerate) {
+                    return capsule_cap_sdf(corner_center_to_point,
+                        corner_radius, corner_smoothing, inset_extent.x);
+                }
+                return capsule_cap_sdf(corner_center_to_point.yx,
+                    corner_radius, corner_smoothing, inset_extent.y);
+            }
+        }
+        var exponent = corner_smoothing;
+        if (corner_smoothing > 2.0 && inset_extent.x <= 0.5) {
+            // Degenerate on both axes (capsules returned above): a circle
+            // stays exactly circular.
+            exponent = 2.0;
         }
         // Signed distance of the point from a quad that is inset by corner_radius.
         // It is negative inside this quad, and positive outside.
