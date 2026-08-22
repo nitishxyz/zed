@@ -400,7 +400,13 @@ fn resolve_corner_exponent(corner_center_to_point: vec2<f32>,
     // Ramp over the first ~1.5px of straight edge so a shape animating
     // between circle and capsule cannot pop between corner families.
     let ramp = clamp(straight_extent / 1.5, 0.0, 1.0);
-    let blend = smoothstep(0.0, 1.0, toward_edge) * ramp;
+    // The transition lives only in the last ~20% of angular travel before
+    // the straight edge: an Lp curve near its axis hugs the circle to
+    // within a fraction of a percent, so the join gains zero curvature
+    // (G2) while the end stays visually a true circular cap. A wider
+    // window renders most of the arc at an elevated exponent, which reads
+    // as a squared-off end.
+    let blend = smoothstep(0.8, 1.0, toward_edge) * ramp;
     return mix(2.0, corner_smoothing, blend);
 }
 
