@@ -334,7 +334,11 @@ fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>,
     corner_smoothing: f32) -> f32 {
   let delta = min(half_size.y - corner - abs(y), 0.0);
   var chord = 0.0;
-  if (corner_smoothing <= 2.0) {
+  // Capsule ends blur with the circular chord: the G2 capsule's tip is
+  // exactly circular, and the exponent blend near the straight edges is
+  // invisible under gaussian blur, while the superellipse chord would
+  // square off the shadow's ends.
+  if (corner_smoothing <= 2.0 || half_size.y - corner <= 0.5) {
     chord = sqrt(max(0.0, corner * corner - delta * delta));
   } else {
     // Superellipse corner: |dx|^p + |dy|^p = r^p.
@@ -353,6 +357,51 @@ fn lp_length(v: vec2<f32>, p: f32) -> f32 {
         return length(v);
     }
     return pow(pow(v.x, p) + pow(v.y, p), 1.0 / p);
+}
+
+// Resolves the corner exponent for one fragment of a smoothed quad.
+//
+// A pure superellipse cannot draw a capsule: at radius = half the short
+// side its pole flattens and the end reads squared-off, while a circular
+// arc joins the straight edge with a visible curvature jump (G1, not G2).
+// When the corner arc consumes the full short side (`inset_extent` is
+// degenerate on one axis), the exponent is blended by direction instead:
+// exactly 2 at the capsule's tip (a true circular end) rising to the full
+// smoothing exponent where the curve meets the straight edge, so curvature
+// reaches zero at the join. A quad that is degenerate on both axes is a
+// circle and stays circular; a quad with both extents keeps the ordinary
+// superellipse corner.
+fn resolve_corner_exponent(corner_center_to_point: vec2<f32>,
+    inset_extent: vec2<f32>, corner_smoothing: f32) -> f32 {
+    let eps = 0.5;
+    let x_degenerate = inset_extent.x <= eps;
+    let y_degenerate = inset_extent.y <= eps;
+    if (x_degenerate && y_degenerate) {
+        return 2.0;
+    }
+    if (!x_degenerate && !y_degenerate) {
+        return corner_smoothing;
+    }
+    let v = max(vec2<f32>(0.0), corner_center_to_point);
+    let total = v.x + v.y;
+    if (total <= 0.0) {
+        return corner_smoothing;
+    }
+    var toward_edge = 0.0;
+    var straight_extent = 0.0;
+    if (y_degenerate) {
+        // Horizontal capsule: straight edges above and below, tip along x.
+        toward_edge = v.y / total;
+        straight_extent = inset_extent.x;
+    } else {
+        toward_edge = v.x / total;
+        straight_extent = inset_extent.y;
+    }
+    // Ramp over the first ~1.5px of straight edge so a shape animating
+    // between circle and capsule cannot pop between corner families.
+    let ramp = clamp(straight_extent / 1.5, 0.0, 1.0);
+    let blend = smoothstep(0.0, 1.0, toward_edge) * ramp;
+    return mix(2.0, corner_smoothing, blend);
 }
 
 // Selects corner radius based on quadrant.
@@ -385,20 +434,26 @@ fn quad_sdf(point: vec2<f32>, bounds: Bounds, corner_radii: Corners,
     let corner_radius = pick_corner_radius(center_to_point, corner_radii);
     let corner_to_point = abs(center_to_point) - half_size;
     let corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius, corner_smoothing);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, corner_smoothing,
+        half_size - corner_radius);
 }
 
 fn quad_sdf_impl(corner_center_to_point: vec2<f32>, corner_radius: f32,
-    corner_smoothing: f32) -> f32 {
+    corner_smoothing: f32, inset_extent: vec2<f32>) -> f32 {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners.
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
+        var exponent = corner_smoothing;
+        if (corner_smoothing > 2.0) {
+            exponent = resolve_corner_exponent(corner_center_to_point,
+                inset_extent, corner_smoothing);
+        }
         // Signed distance of the point from a quad that is inset by corner_radius.
         // It is negative inside this quad, and positive outside.
         let signed_distance_to_inset_quad =
             // 0 inside the inset quad, and positive outside.
-            lp_length(max(vec2<f32>(0.0), corner_center_to_point), corner_smoothing) +
+            lp_length(max(vec2<f32>(0.0), corner_center_to_point), exponent) +
             // 0 outside the inset quad, and negative inside.
             min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
 
@@ -679,7 +734,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     // Signed distance of the point to the outside edge of the quad's border. It
     // is positive outside this edge, and negative inside.
     let outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
-        quad.corner_smoothing);
+        quad.corner_smoothing, half_size - corner_radius);
 
     // Approximate signed distance of the point to the inside edge of the quad's
     // border. It is negative outside this edge (within the border), and
