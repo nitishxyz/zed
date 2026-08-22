@@ -382,32 +382,15 @@ fn resolve_corner_exponent(corner_center_to_point: vec2<f32>,
     if (!x_degenerate && !y_degenerate) {
         return corner_smoothing;
     }
-    let v = max(vec2<f32>(0.0), corner_center_to_point);
-    let total = v.x + v.y;
-    if (total <= 0.0) {
-        return corner_smoothing;
-    }
-    var toward_edge = 0.0;
-    var straight_extent = 0.0;
-    if (y_degenerate) {
-        // Horizontal capsule: straight edges above and below, tip along x.
-        toward_edge = v.y / total;
-        straight_extent = inset_extent.x;
-    } else {
-        toward_edge = v.x / total;
-        straight_extent = inset_extent.y;
-    }
-    // Ramp over the first ~1.5px of straight edge so a shape animating
-    // between circle and capsule cannot pop between corner families.
-    let ramp = clamp(straight_extent / 1.5, 0.0, 1.0);
-    // The transition lives only in the last ~20% of angular travel before
-    // the straight edge: an Lp curve near its axis hugs the circle to
-    // within a fraction of a percent, so the join gains zero curvature
-    // (G2) while the end stays visually a true circular cap. A wider
-    // window renders most of the arc at an elevated exponent, which reads
-    // as a squared-off end.
-    let blend = smoothstep(0.8, 1.0, toward_edge) * ramp;
-    return mix(2.0, corner_smoothing, blend);
+    // Capsule: circular ends. Exponent-blend experiments that ramped the
+    // curve to zero curvature at the straight-edge join (G2) made the
+    // boundary hug the straight line over the last stretch of the arc,
+    // which antialiasing renders as a faint flat tail - the straight edge
+    // reads as detached from the arc at hairline scale. A truly
+    // continuous-curvature capsule needs a spline that borrows length
+    // from the straight edge, which an exponent field cannot express, so
+    // capsules keep the classical circular arc.
+    return 2.0;
 }
 
 // Selects corner radius based on quadrant.
