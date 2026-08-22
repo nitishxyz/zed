@@ -414,7 +414,15 @@ fn capsule_cap_sdf(cap: vec2<f32>, corner_radius: f32, corner_smoothing: f32,
     }
     let v = max(cap.y, 0.0);
     let toward_join = v / max(length(vec2<f32>(u, v)), 1e-4);
-    let p = mix(2.0, corner_smoothing, toward_join);
+    // The cap is the stretched ellipse for most of its arc: blending the
+    // exponent linearly by direction bulges the curve outside the ellipse
+    // at diagonal directions (worst near 45 degrees), which the stretch
+    // amplifies into squared-off shoulders. Only the join neighborhood
+    // ramps to the full exponent - the borrowed length is the runway that
+    // lets curvature reach zero there without the flat tail hugging a
+    // circular cap would produce.
+    let p = mix(2.0, corner_smoothing,
+        smoothstep(0.8, 1.0, toward_join));
     let n = max(pow(pow(u, p) + pow(v, p), 1.0 / p), 1e-4);
     let grad = vec2<f32>(pow(u / n, p - 1.0) / k, pow(v / n, p - 1.0));
     return (n - corner_radius) / max(length(grad), 1e-4);
