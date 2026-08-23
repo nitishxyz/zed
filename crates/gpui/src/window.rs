@@ -4722,6 +4722,38 @@ impl Window {
         });
     }
 
+    /// Imports a Linux DMA-BUF as a renderer-owned external texture.
+    #[cfg(target_os = "linux")]
+    pub fn import_dmabuf_texture(
+        &mut self,
+        descriptor: crate::DmabufTextureDescriptor,
+    ) -> Result<crate::ExternalTexture> {
+        self.platform_window.import_dmabuf_texture(descriptor)
+    }
+
+    /// Paint a Linux external texture into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "linux")]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        external_texture: crate::ExternalTexture,
+    ) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            external_texture,
+        });
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

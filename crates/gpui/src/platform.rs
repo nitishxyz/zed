@@ -853,6 +853,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    #[cfg(target_os = "linux")]
+    fn import_dmabuf_texture(
+        &self,
+        _descriptor: crate::DmabufTextureDescriptor,
+    ) -> anyhow::Result<crate::ExternalTexture> {
+        anyhow::bail!("DMA-BUF texture import is not supported by this window")
+    }
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()

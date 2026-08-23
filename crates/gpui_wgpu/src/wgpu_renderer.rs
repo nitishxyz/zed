@@ -1041,10 +1041,14 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        #[cfg(target_os = "linux")]
+        let surface_fragment_entry = "fs_external_surface";
+        #[cfg(not(target_os = "linux"))]
+        let surface_fragment_entry = "fs_surface";
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
-            "fs_surface",
+            surface_fragment_entry,
             &layouts.globals,
             &layouts.surfaces,
             None,
@@ -1262,6 +1266,14 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn import_dmabuf_texture(
+        &self,
+        descriptor: gpui::DmabufTextureDescriptor,
+    ) -> Result<gpui::ExternalTexture> {
+        crate::external_texture::import_dmabuf_texture(&self.resources().device, descriptor)
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
@@ -1419,6 +1431,9 @@ impl WgpuRenderer {
                 )
             })?;
 
+        #[cfg(target_os = "linux")]
+        let surface_bind_groups = self.create_surface_bind_groups(scene)?;
+
         let mut encoder =
             self.resources()
                 .device
@@ -1526,9 +1541,25 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        #[cfg(target_os = "linux")]
+                        {
+                            pass.set_pipeline(&self.resources().pipelines.surfaces);
+                            pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+                            for index in range {
+                                let bind_group =
+                                    surface_bind_groups.get(index).ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "missing external surface bind group {index}"
+                                        )
+                                    })?;
+                                pass.set_bind_group(1, bind_group, &[]);
+                                pass.draw(0..4, 0..1);
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = range;
+                    }
                 }
             }
         }
@@ -1576,6 +1607,62 @@ impl WgpuRenderer {
                 &scene.polychrome_sprites,
             )?,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_surface_bind_groups(&self, scene: &Scene) -> Result<Vec<wgpu::BindGroup>> {
+        let resources = self.resources();
+        scene
+            .surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| {
+                let texture = surface
+                    .external_texture
+                    .as_any()
+                    .downcast_ref::<crate::external_texture::ImportedTexture>()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("external surface has an incompatible renderer")
+                    })?;
+                let params = SurfaceParams {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                };
+                let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("surface_params"),
+                    size: std::mem::size_of::<SurfaceParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                resources
+                    .queue
+                    .write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
+                Ok(resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("external_surface_{index}")),
+                        layout: &resources.bind_group_layouts.surfaces,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&texture.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(&texture.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                            },
+                        ],
+                    }))
+            })
+            .collect()
     }
 
     fn create_texture_bind_group(

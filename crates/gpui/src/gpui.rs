@@ -21,6 +21,8 @@ pub mod colors;
 mod element;
 mod elements;
 mod executor;
+#[cfg(target_os = "linux")]
+mod external_texture;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -98,6 +100,8 @@ pub use ctor::ctor;
 pub use element::*;
 pub use elements::*;
 pub use executor::*;
+#[cfg(target_os = "linux")]
+pub use external_texture::*;
 pub use geometry::*;
 pub use gestures::*;
 pub use global::*;

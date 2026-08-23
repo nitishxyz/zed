@@ -1501,6 +1501,15 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 }
 
 @fragment
+fn fs_external_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    return textureSampleLevel(t_y, s_surface, input.texture_position, 0.0);
+}
+
+@fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
