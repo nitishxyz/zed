@@ -339,21 +339,25 @@ fn blur_along_x(x: f32, y: f32, sigma: f32, corner: f32, half_size: vec2<f32>,
     // Circular corner: circular chord.
     chord = sqrt(max(0.0, corner * corner - delta * delta));
   } else if (half_size.y - corner <= 0.5) {
-    // Smoothed horizontal capsule: chord of the elongated end cap,
-    // approximated by the stretched ellipse (gaussian blur hides the
-    // exponent blend). See capsule_cap_sdf.
+    // Smoothed horizontal capsule: chord of the elongated end cap. See
+    // capsule_cap_sdf: boundary u = r * (1 - (v/r)^2)^(1/q), mapped back
+    // to screen x by the stretch k.
     let k = min(CAPSULE_CAP_STRETCH,
         1.0 + max(half_size.x - corner, 0.0) / max(corner, 0.5));
-    chord = k * sqrt(max(0.0, corner * corner - delta * delta))
+    let q = 2.0 * k;
+    let vn = clamp(abs(delta) / max(corner, 0.5), 0.0, 1.0);
+    chord = k * corner * pow(max(0.0, 1.0 - vn * vn), 1.0 / q)
         - (k - 1.0) * corner;
   } else if (half_size.x - corner <= 0.5) {
-    // Smoothed vertical capsule: the cap consumes `k * corner` of height;
-    // map the height offset into the stretched cap, then take the
-    // elliptical chord.
+    // Smoothed vertical capsule: map the height offset into the stretched
+    // cap coordinate, then take the cap's width at that offset:
+    // v = r * sqrt(1 - (u/r)^q).
     let k = min(CAPSULE_CAP_STRETCH,
         1.0 + max(half_size.y - corner, 0.0) / max(corner, 0.5));
-    let w = max(((k - 1.0) * corner - raw) / k, 0.0);
-    chord = sqrt(max(0.0, corner * corner - w * w));
+    let q = 2.0 * k;
+    let u = max(((k - 1.0) * corner - raw) / k, 0.0);
+    let un = min(u / max(corner, 0.5), 1.0);
+    chord = corner * sqrt(max(0.0, 1.0 - pow(un, q)));
   } else {
     // Superellipse corner: |dx|^p + |dy|^p = r^p.
     chord = pow(max(0.0, pow(corner, corner_smoothing) -
@@ -413,19 +417,23 @@ fn capsule_cap_sdf(cap: vec2<f32>, corner_radius: f32, corner_smoothing: f32,
         return max(cap.x, cap.y) - corner_radius;
     }
     let v = max(cap.y, 0.0);
-    let toward_join = v / max(length(vec2<f32>(u, v)), 1e-4);
-    // The cap is the stretched ellipse for most of its arc: blending the
-    // exponent linearly by direction bulges the curve outside the ellipse
-    // at diagonal directions (worst near 45 degrees), which the stretch
-    // amplifies into squared-off shoulders. Only the join neighborhood
-    // ramps to the full exponent - the borrowed length is the runway that
-    // lets curvature reach zero there without the flat tail hugging a
-    // circular cap would produce.
-    let p = mix(2.0, corner_smoothing,
-        smoothstep(0.8, 1.0, toward_join));
-    let n = max(pow(pow(u, p) + pow(v, p), 1.0 / p), 1e-4);
-    let grad = vec2<f32>(pow(u / n, p - 1.0) / k, pow(v / n, p - 1.0));
-    return (n - corner_radius) / max(length(grad), 1e-4);
+    // Axis-asymmetric superellipse (u/r)^q + (v/r)^2 = 1 on the compressed
+    // long-axis coordinate, q = 2k. The exponent is chosen so the screen-
+    // space curvature radius at the tip is exactly r - the end reads as a
+    // circular pill tip - while curvature at the straight-edge join is zero
+    // (G2) for q > 2, easing in over the borrowed cap length. Directional
+    // exponent blends are avoided entirely: they bulge outside the ellipse
+    // at diagonal directions and the stretch amplifies that into squared
+    // shoulders. k -> 1 gives q = 2, an exact circle.
+    let q = 2.0 * k;
+    let un = u / corner_radius;
+    let vn = v / corner_radius;
+    let f = pow(un, q) + vn * vn;
+    // Screen-space gradient (u is compressed by k) normalizes the implicit
+    // field into true pixel distance near the boundary, keeping antialias
+    // and border widths uniform along the curve.
+    let grad = vec2<f32>(q * pow(un, q - 1.0) / k, 2.0 * vn) / corner_radius;
+    return (f - 1.0) / max(length(grad), 1e-4);
 }
 
 // Selects corner radius based on quadrant.
