@@ -2375,7 +2375,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 let scroll_delta = state
                     .continuous_scroll_delta
                     .get_or_insert(point(px(0.0), px(0.0)));
-                let platform_pixel_gain = 1.5;
+                // The platform compositor applies scroll physics in logical pixels, so preserve 1:1 deltas.
+                let platform_pixel_gain = 1.0;
                 match axis {
                     wl_pointer::Axis::VerticalScroll => {
                         scroll_delta.y += px(value as f32 * platform_pixel_gain * axis_modifier);
