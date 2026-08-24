@@ -1705,11 +1705,11 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn import_dmabuf_texture(
+    fn copy_dmabuf_texture(
         &self,
         descriptor: DmabufTextureDescriptor,
     ) -> anyhow::Result<ExternalTexture> {
-        self.borrow().renderer.import_dmabuf_texture(descriptor)
+        self.borrow().renderer.copy_dmabuf_texture(descriptor)
     }
 
     fn draw(&self, scene: &Scene) {

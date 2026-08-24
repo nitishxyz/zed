@@ -1701,7 +1701,7 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
-    fn import_dmabuf_texture(
+    fn copy_dmabuf_texture(
         &self,
         descriptor: DmabufTextureDescriptor,
     ) -> anyhow::Result<ExternalTexture> {
@@ -1709,7 +1709,7 @@ impl PlatformWindow for X11Window {
             .state
             .borrow()
             .renderer
-            .import_dmabuf_texture(descriptor)
+            .copy_dmabuf_texture(descriptor)
     }
 
     fn draw(&self, scene: &Scene) {

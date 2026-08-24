@@ -1267,11 +1267,24 @@ impl WgpuRenderer {
     }
 
     #[cfg(target_os = "linux")]
+    pub fn copy_dmabuf_texture(
+        &self,
+        descriptor: gpui::DmabufTextureDescriptor,
+    ) -> Result<gpui::ExternalTexture> {
+        let resources = self.resources();
+        crate::external_texture::copy_dmabuf_texture(
+            &resources.device,
+            &resources.queue,
+            descriptor,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn import_dmabuf_texture(
         &self,
         descriptor: gpui::DmabufTextureDescriptor,
     ) -> Result<gpui::ExternalTexture> {
-        crate::external_texture::import_dmabuf_texture(&self.resources().device, descriptor)
+        self.copy_dmabuf_texture(descriptor)
     }
 
     pub fn draw(&mut self, scene: &Scene) -> bool {
@@ -1620,7 +1633,7 @@ impl WgpuRenderer {
                 let texture = surface
                     .external_texture
                     .as_any()
-                    .downcast_ref::<crate::external_texture::ImportedTexture>()
+                    .downcast_ref::<crate::external_texture::RendererOwnedTexture>()
                     .ok_or_else(|| {
                         anyhow::anyhow!("external surface has an incompatible renderer")
                     })?;

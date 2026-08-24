@@ -4722,13 +4722,28 @@ impl Window {
         });
     }
 
-    /// Imports a Linux DMA-BUF as a renderer-owned external texture.
+    /// Copies a Linux DMA-BUF into a renderer-owned external texture.
+    ///
+    /// The source DMA-BUF is released after the GPU copy completes, so queued textures do not
+    /// retain buffers from the producer's export pool.
+    #[cfg(target_os = "linux")]
+    pub fn copy_dmabuf_texture(
+        &mut self,
+        descriptor: crate::DmabufTextureDescriptor,
+    ) -> Result<crate::ExternalTexture> {
+        self.platform_window.copy_dmabuf_texture(descriptor)
+    }
+
+    /// Copies a Linux DMA-BUF into a renderer-owned external texture.
+    ///
+    /// This compatibility alias has the same copy-out semantics as [`Self::copy_dmabuf_texture`].
+    /// The returned texture does not retain the source DMA-BUF after its GPU copy completes.
     #[cfg(target_os = "linux")]
     pub fn import_dmabuf_texture(
         &mut self,
         descriptor: crate::DmabufTextureDescriptor,
     ) -> Result<crate::ExternalTexture> {
-        self.platform_window.import_dmabuf_texture(descriptor)
+        self.copy_dmabuf_texture(descriptor)
     }
 
     /// Paint a Linux external texture into the scene for the next frame at the current z-index.

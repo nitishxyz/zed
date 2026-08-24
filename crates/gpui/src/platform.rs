@@ -854,6 +854,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn is_subpixel_rendering_supported(&self) -> bool;
 
     #[cfg(target_os = "linux")]
+    fn copy_dmabuf_texture(
+        &self,
+        descriptor: crate::DmabufTextureDescriptor,
+    ) -> anyhow::Result<crate::ExternalTexture> {
+        self.import_dmabuf_texture(descriptor)
+    }
+
+    #[cfg(target_os = "linux")]
     fn import_dmabuf_texture(
         &self,
         _descriptor: crate::DmabufTextureDescriptor,

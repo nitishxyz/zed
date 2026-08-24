@@ -12,9 +12,13 @@ const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
 const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
 
-pub(crate) struct ImportedTexture {
+pub(crate) struct RendererOwnedTexture {
     _texture: wgpu::Texture,
     pub(crate) view: wgpu::TextureView,
+}
+
+struct ImportedTexture {
+    texture: wgpu::Texture,
 }
 
 pub(crate) fn create_vulkan_device(
@@ -69,13 +73,46 @@ pub(crate) fn create_vulkan_device(
     }
 }
 
-pub(crate) fn import_dmabuf_texture(
+pub(crate) fn copy_dmabuf_texture(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     descriptor: DmabufTextureDescriptor,
 ) -> Result<ExternalTexture> {
     let format = texture_format_for_drm_fourcc(descriptor.drm_format)?;
     validate_descriptor(&descriptor)?;
+    let size = wgpu::Extent3d {
+        width: descriptor.width,
+        height: descriptor.height,
+        depth_or_array_layers: 1,
+    };
+    let imported_texture = import_dmabuf_texture(device, descriptor, size, format)?;
+    let owned_texture = device.create_texture(&owned_texture_descriptor(size, format));
+    let view = owned_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpui_dmabuf_copy"),
+    });
+    encoder.copy_texture_to_texture(
+        imported_texture.texture.as_image_copy(),
+        owned_texture.as_image_copy(),
+        size,
+    );
+    queue.submit([encoder.finish()]);
+    queue.on_submitted_work_done(move || {
+        imported_texture.texture.destroy();
+    });
 
+    Ok(ExternalTexture::new(Arc::new(RendererOwnedTexture {
+        _texture: owned_texture,
+        view,
+    })))
+}
+
+fn import_dmabuf_texture(
+    device: &wgpu::Device,
+    descriptor: DmabufTextureDescriptor,
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+) -> Result<ImportedTexture> {
     // SAFETY: Every Vulkan object is created from wgpu's own logical device. The imported file
     // descriptor is transferred to Vulkan only after successful allocation, and the HAL texture
     // takes ownership of both the image and dedicated memory. Descriptor validation ensures all
@@ -130,7 +167,7 @@ pub(crate) fn import_dmabuf_texture(
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
@@ -191,19 +228,14 @@ pub(crate) fn import_dmabuf_texture(
             return Err(anyhow!(error).context("Failed to bind imported DMA-BUF memory"));
         }
 
-        let size = wgpu::Extent3d {
-            width: descriptor.width,
-            height: descriptor.height,
-            depth_or_array_layers: 1,
-        };
         let hal_descriptor = hal::TextureDescriptor {
-            label: Some("gpui_dmabuf_texture"),
+            label: Some("gpui_imported_dmabuf_texture"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::wgt::TextureUses::RESOURCE,
+            usage: wgpu::wgt::TextureUses::COPY_SRC,
             memory_flags: hal::MemoryFlags::empty(),
             view_formats: Vec::new(),
         };
@@ -214,22 +246,34 @@ pub(crate) fn import_dmabuf_texture(
             hal::vulkan::TextureMemory::Dedicated(memory),
         );
         let wgpu_descriptor = wgpu::TextureDescriptor {
-            label: Some("gpui_dmabuf_texture"),
+            label: Some("gpui_imported_dmabuf_texture"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         };
         let texture = device.create_texture_from_hal::<Vulkan>(hal_texture, &wgpu_descriptor);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Ok(ExternalTexture::new(Arc::new(ImportedTexture {
-            _texture: texture,
-            view,
-        })))
+        Ok(ImportedTexture { texture })
+    }
+}
+
+fn owned_texture_descriptor(
+    size: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureDescriptor<'static> {
+    wgpu::TextureDescriptor {
+        label: Some("gpui_owned_external_texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
     }
 }
 
@@ -281,5 +325,22 @@ mod tests {
             wgpu::TextureFormat::Rgba8Unorm
         );
         assert!(texture_format_for_drm_fourcc(0).is_err());
+    }
+
+    #[test]
+    fn owned_texture_supports_copy_out_and_sampling() {
+        let size = wgpu::Extent3d {
+            width: 2800,
+            height: 1756,
+            depth_or_array_layers: 1,
+        };
+        let descriptor = owned_texture_descriptor(size, wgpu::TextureFormat::Bgra8Unorm);
+
+        assert_eq!(descriptor.size, size);
+        assert_eq!(descriptor.format, wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(
+            descriptor.usage,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING
+        );
     }
 }
