@@ -180,6 +180,8 @@ enum InstanceData {
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    #[cfg(target_os = "linux")]
+    dmabuf_retirement: Arc<crate::external_texture::DmabufRetirement>,
     surface: wgpu::Surface<'static>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
@@ -564,6 +566,8 @@ impl WgpuRenderer {
         let resources = WgpuResources {
             device,
             queue,
+            #[cfg(target_os = "linux")]
+            dmabuf_retirement: Arc::new(crate::external_texture::DmabufRetirement::new()),
             surface,
             pipelines,
             bind_group_layouts,
@@ -1275,6 +1279,7 @@ impl WgpuRenderer {
         crate::external_texture::copy_dmabuf_texture(
             &resources.device,
             &resources.queue,
+            &resources.dmabuf_retirement,
             descriptor,
         )
     }

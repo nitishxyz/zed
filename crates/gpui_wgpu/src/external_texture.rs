@@ -3,7 +3,10 @@ use ash::{ext, khr, vk};
 use gpui::{DmabufTextureDescriptor, ExternalTexture};
 use std::{
     os::fd::{FromRawFd, IntoRawFd},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use wgpu::hal::{self, api::Vulkan};
 
@@ -11,6 +14,7 @@ const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const DRM_FORMAT_ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
 const DRM_FORMAT_XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
+const MAX_PENDING_DMABUF_RETIREMENTS: usize = 16;
 
 pub(crate) struct RendererOwnedTexture {
     _texture: wgpu::Texture,
@@ -19,6 +23,50 @@ pub(crate) struct RendererOwnedTexture {
 
 struct ImportedTexture {
     texture: wgpu::Texture,
+}
+
+pub(crate) struct DmabufRetirement {
+    pending: AtomicUsize,
+    max_pending: usize,
+}
+
+impl DmabufRetirement {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            max_pending: MAX_PENDING_DMABUF_RETIREMENTS,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<DmabufRetirementPermit> {
+        self.pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                (pending < self.max_pending).then_some(pending + 1)
+            })
+            .ok()?;
+        Some(DmabufRetirementPermit {
+            retirement: self.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_capacity(max_pending: usize) -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            max_pending,
+        }
+    }
+}
+
+struct DmabufRetirementPermit {
+    retirement: Arc<DmabufRetirement>,
+}
+
+impl Drop for DmabufRetirementPermit {
+    fn drop(&mut self) {
+        let previous = self.retirement.pending.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
 }
 
 pub(crate) fn create_vulkan_device(
@@ -76,8 +124,23 @@ pub(crate) fn create_vulkan_device(
 pub(crate) fn copy_dmabuf_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    retirement: &Arc<DmabufRetirement>,
     descriptor: DmabufTextureDescriptor,
 ) -> Result<ExternalTexture> {
+    let retirement_permit = match retirement.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            device
+                .poll(wgpu::PollType::Poll)
+                .context("Failed to poll completed DMA-BUF copies")?;
+            retirement.try_acquire().ok_or_else(|| {
+                anyhow!(
+                    "too many DMA-BUF textures are awaiting GPU copy completion (maximum {})",
+                    retirement.max_pending
+                )
+            })?
+        }
+    };
     let format = texture_format_for_drm_fourcc(descriptor.drm_format)?;
     validate_descriptor(&descriptor)?;
     let size = wgpu::Extent3d {
@@ -99,6 +162,8 @@ pub(crate) fn copy_dmabuf_texture(
     queue.submit([encoder.finish()]);
     queue.on_submitted_work_done(move || {
         imported_texture.texture.destroy();
+        drop(imported_texture);
+        drop(retirement_permit);
     });
 
     Ok(ExternalTexture::new(Arc::new(RendererOwnedTexture {
@@ -342,5 +407,22 @@ mod tests {
             descriptor.usage,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING
         );
+    }
+
+    #[test]
+    fn dmabuf_retirement_is_bounded_and_releases_capacity() -> Result<()> {
+        let retirement = Arc::new(DmabufRetirement::with_capacity(2));
+        let first = retirement
+            .try_acquire()
+            .ok_or_else(|| anyhow!("first retirement permit was unavailable"))?;
+        let second = retirement
+            .try_acquire()
+            .ok_or_else(|| anyhow!("second retirement permit was unavailable"))?;
+
+        assert!(retirement.try_acquire().is_none());
+        drop(first);
+        assert!(retirement.try_acquire().is_some());
+        drop(second);
+        Ok(())
     }
 }
