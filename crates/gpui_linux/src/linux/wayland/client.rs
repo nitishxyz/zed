@@ -52,7 +52,7 @@ use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_source_v1,
 };
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
-    ContentHint, ContentPurpose,
+    ChangeCause, ContentHint, ContentPurpose,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
@@ -100,11 +100,12 @@ use crate::linux::{
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
-    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NativeDragVisual, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    Size, TextInputPurpose, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
+    profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -116,6 +117,102 @@ const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
+const ACTIVATION_INPUT_MAX_AGE: Duration = Duration::from_secs(5);
+const MAX_SURROUNDING_BYTES: usize = 4096;
+
+#[derive(Clone, Debug)]
+struct SentSurrounding {
+    text: String,
+    start_utf16: usize,
+    cursor_byte: usize,
+}
+
+#[derive(Default)]
+struct PendingImeBatch {
+    generation: u64,
+    delete: Option<(u32, u32)>,
+    commit: Option<String>,
+    preedit: Option<String>,
+}
+
+fn utf16_to_byte(text: &str, offset: usize) -> Option<usize> {
+    let mut units = 0;
+    for (byte, ch) in text.char_indices() {
+        if units == offset {
+            return Some(byte);
+        }
+        units += ch.len_utf16();
+        if units > offset {
+            return None;
+        }
+    }
+    (units == offset).then_some(text.len())
+}
+
+fn bounded_surrounding(
+    text: String,
+    range_start_utf16: usize,
+    selection: &gpui::UTF16Selection,
+) -> Option<(SentSurrounding, i32)> {
+    let cursor_utf16 = if selection.reversed {
+        selection.range.start
+    } else {
+        selection.range.end
+    };
+    let anchor_utf16 = if selection.reversed {
+        selection.range.end
+    } else {
+        selection.range.start
+    };
+    let cursor = utf16_to_byte(&text, cursor_utf16.checked_sub(range_start_utf16)?)?;
+    let anchor = utf16_to_byte(&text, anchor_utf16.checked_sub(range_start_utf16)?)?;
+    let mut start = cursor.saturating_sub(MAX_SURROUNDING_BYTES / 2);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (start + MAX_SURROUNDING_BYTES).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if cursor > end {
+        end = cursor;
+        start = end.saturating_sub(MAX_SURROUNDING_BYTES);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    let prefix_utf16 = text[..start].encode_utf16().count();
+    let rebased_anchor = anchor.clamp(start, end) - start;
+    Some((
+        SentSurrounding {
+            text: text[start..end].to_string(),
+            start_utf16: range_start_utf16 + prefix_utf16,
+            cursor_byte: cursor - start,
+        },
+        i32::try_from(rebased_anchor).ok()?,
+    ))
+}
+
+fn delete_range_utf16(
+    sent: &SentSurrounding,
+    before: u32,
+    after: u32,
+) -> Option<std::ops::Range<usize>> {
+    let before = usize::try_from(before).ok()?;
+    let after = usize::try_from(after).ok()?;
+    let start = sent.cursor_byte.checked_sub(before)?;
+    let end = sent.cursor_byte.checked_add(after)?;
+    if end > sent.text.len()
+        || !sent.text.is_char_boundary(start)
+        || !sent.text.is_char_boundary(end)
+    {
+        return None;
+    }
+    Some(
+        sent.start_utf16 + sent.text[..start].encode_utf16().count()
+            ..sent.start_utf16 + sent.text[..end].encode_utf16().count(),
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImeCursorRectangle {
@@ -138,6 +235,7 @@ impl From<Bounds<Pixels>> for ImeCursorRectangle {
 
 trait ImeCursorRectangleSink {
     fn set_ime_cursor_rectangle(&self, x: i32, y: i32, width: i32, height: i32);
+    #[cfg(test)]
     fn commit_ime_state(&self);
 }
 
@@ -146,6 +244,7 @@ impl ImeCursorRectangleSink for zwp_text_input_v3::ZwpTextInputV3 {
         self.set_cursor_rectangle(x, y, width, height);
     }
 
+    #[cfg(test)]
     fn commit_ime_state(&self) {
         self.commit();
     }
@@ -163,6 +262,7 @@ fn set_ime_cursor_rectangle(
     );
 }
 
+#[cfg(test)]
 fn update_ime_cursor_rectangle(
     text_input: &impl ImeCursorRectangleSink,
     last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
@@ -178,6 +278,7 @@ fn update_ime_cursor_rectangle(
     text_input.commit_ime_state();
 }
 
+#[cfg(test)]
 fn set_ime_cursor_rectangle_after_done(
     text_input: &impl ImeCursorRectangleSink,
     last_ime_cursor_rectangle: &mut Option<ImeCursorRectangle>,
@@ -323,6 +424,9 @@ pub(crate) struct WaylandClientState {
     pre_edit_text: Option<String>,
     ime_pre_edit: Option<String>,
     composing: bool,
+    ime_generation: u64,
+    pending_ime_batch: PendingImeBatch,
+    sent_surrounding: Option<SentSurrounding>,
     last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
     // Surface to Window mapping
     windows: HashMap<ObjectId, WaylandWindowStatePtr>,
@@ -358,6 +462,7 @@ pub(crate) struct WaylandClientState {
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
     cursor: Cursor,
     pending_activation: Option<PendingActivation>,
+    recent_activation_input: Option<RecentActivationInput>,
     startup_activation_token: Option<String>,
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
@@ -505,6 +610,16 @@ pub(crate) struct KeyRepeat {
     current_keycode: Option<xkb::Keycode>,
 }
 
+struct RecentActivationInput {
+    recorded_at: Instant,
+    serial: Serial,
+    surface: ObjectId,
+}
+
+fn activation_input_is_eligible(recorded_at: Instant, same_surface: bool) -> bool {
+    same_surface && recorded_at.elapsed() <= ACTIVATION_INPUT_MAX_AGE
+}
+
 pub(crate) enum PendingActivation {
     /// URI to open in the web browser.
     Uri(String),
@@ -512,6 +627,20 @@ pub(crate) enum PendingActivation {
     Path(PathBuf),
     /// A window from ourselves to raise.
     Window(ObjectId),
+    /// A one-shot token requested by application code.
+    Callback(Box<dyn FnOnce(Option<String>)>),
+}
+
+fn take_pending_activation_callback(
+    pending: &mut Option<PendingActivation>,
+) -> Option<Box<dyn FnOnce(Option<String>)>> {
+    if !matches!(pending, Some(PendingActivation::Callback(_))) {
+        return None;
+    }
+    let Some(PendingActivation::Callback(callback)) = pending.take() else {
+        unreachable!("variant checked above");
+    };
+    Some(callback)
 }
 
 impl WaylandClientState {
@@ -530,6 +659,57 @@ impl WaylandClientState {
 /// window to GPUI.
 #[derive(Clone)]
 pub struct WaylandClientStatePtr(Weak<RefCell<WaylandClientState>>);
+
+fn configure_text_input(
+    text_input: &zwp_text_input_v3::ZwpTextInputV3,
+    state: &mut WaylandClientState,
+    context: Option<super::window::ImeContext>,
+    fallback_bounds: Option<Bounds<Pixels>>,
+) {
+    let purpose = context
+        .as_ref()
+        .map_or(TextInputPurpose::Normal, |context| context.purpose);
+    let (hints, protocol_purpose) = match purpose {
+        TextInputPurpose::Normal => (ContentHint::None, ContentPurpose::Normal),
+        TextInputPurpose::Search => (ContentHint::None, ContentPurpose::Normal),
+        TextInputPurpose::Email => (ContentHint::None, ContentPurpose::Email),
+        TextInputPurpose::Url => (ContentHint::None, ContentPurpose::Url),
+        TextInputPurpose::Number => (ContentHint::None, ContentPurpose::Number),
+        TextInputPurpose::Terminal => (ContentHint::None, ContentPurpose::Terminal),
+        TextInputPurpose::Password => (
+            ContentHint::HiddenText | ContentHint::SensitiveData,
+            ContentPurpose::Password,
+        ),
+    };
+    text_input.set_content_type(hints, protocol_purpose);
+    text_input.set_text_change_cause(ChangeCause::Other);
+    if purpose.is_sensitive() {
+        text_input.set_surrounding_text(String::new(), 0, 0);
+        state.sent_surrounding = None;
+    } else if let Some(context) = context.as_ref() {
+        if let Some((sent, anchor)) = bounded_surrounding(
+            context.text.clone(),
+            context.actual_range_utf16.start,
+            &context.selection,
+        ) {
+            text_input.set_surrounding_text(
+                sent.text.clone(),
+                i32::try_from(sent.cursor_byte).unwrap_or_default(),
+                anchor,
+            );
+            state.sent_surrounding = Some(sent);
+        }
+    }
+    if let Some(bounds) = context
+        .and_then(|context| context.bounds)
+        .or(fallback_bounds)
+    {
+        let rectangle = ImeCursorRectangle::from(bounds);
+        set_ime_cursor_rectangle(text_input, rectangle);
+        state.last_ime_cursor_rectangle = Some(rectangle);
+    }
+    text_input.commit();
+}
 
 impl WaylandClientStatePtr {
     pub fn get_client(&self) -> Rc<RefCell<WaylandClientState>> {
@@ -604,6 +784,40 @@ impl WaylandClientStatePtr {
             Some(PendingActivation::Window(window));
     }
 
+    pub fn request_activation_token(
+        &self,
+        surface: &wl_surface::WlSurface,
+        callback: Box<dyn FnOnce(Option<String>)>,
+    ) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if state.pending_activation.is_some() {
+            drop(state);
+            callback(None);
+            return;
+        }
+        let Some(input) = state.recent_activation_input.take() else {
+            drop(state);
+            callback(None);
+            return;
+        };
+        if !activation_input_is_eligible(input.recorded_at, input.surface == surface.id()) {
+            drop(state);
+            callback(None);
+            return;
+        }
+        let Some(activation) = state.globals.activation.clone() else {
+            drop(state);
+            callback(None);
+            return;
+        };
+        state.pending_activation = Some(PendingActivation::Callback(callback));
+        let token = activation.get_activation_token(&state.globals.qh, ());
+        token.set_serial(input.serial.as_raw(), &state.wl_seat);
+        token.set_surface(surface);
+        token.commit();
+    }
+
     pub fn enable_ime(&self) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
@@ -612,21 +826,12 @@ impl WaylandClientStatePtr {
         let Some(text_input) = state.text_input.take() else {
             return;
         };
-
         text_input.enable();
-        text_input.set_content_type(ContentHint::None, ContentPurpose::Normal);
-        let mut cursor_rectangle = None;
-        if let Some(window) = state.keyboard_focused_window.clone() {
-            drop(state);
-            if let Some(area) = window.get_ime_area() {
-                let area = ImeCursorRectangle::from(area);
-                set_ime_cursor_rectangle(&text_input, area);
-                cursor_rectangle = Some(area);
-            }
-            state = client.borrow_mut();
-        }
-        text_input.commit();
-        state.last_ime_cursor_rectangle = cursor_rectangle;
+        let window = state.keyboard_focused_window.clone();
+        drop(state);
+        let context = window.as_ref().and_then(|window| window.get_ime_context());
+        state = client.borrow_mut();
+        configure_text_input(&text_input, &mut state, context, None);
         state.text_input = Some(text_input);
     }
 
@@ -635,9 +840,17 @@ impl WaylandClientStatePtr {
         let mut state = client.borrow_mut();
         state.ime_enabled = Some(false);
         state.composing = false;
+        state.ime_generation = state.ime_generation.wrapping_add(1);
+        state.pending_ime_batch = PendingImeBatch::default();
+        state.sent_surrounding = None;
+        let window = state.keyboard_focused_window.clone();
         if let Some(text_input) = &state.text_input {
             text_input.disable();
             text_input.commit();
+        }
+        drop(state);
+        if let Some(window) = window {
+            window.handle_ime(ImeInput::DeleteText);
         }
     }
 
@@ -649,13 +862,15 @@ impl WaylandClientStatePtr {
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        if state.pre_edit_text.is_some() {
-            return;
-        }
-        let Some(text_input) = state.text_input.clone() else {
+        let Some(text_input) = state.text_input.take() else {
             return;
         };
-        update_ime_cursor_rectangle(&text_input, &mut state.last_ime_cursor_rectangle, bounds);
+        let window = state.keyboard_focused_window.clone();
+        drop(state);
+        let context = window.as_ref().and_then(|window| window.get_ime_context());
+        state = client.borrow_mut();
+        configure_text_input(&text_input, &mut state, context, Some(bounds));
+        state.text_input = Some(text_input);
     }
 
     pub fn handle_keyboard_layout_change(&self) {
@@ -972,6 +1187,9 @@ impl WaylandClient {
             pre_edit_text: None,
             ime_pre_edit: None,
             composing: false,
+            ime_generation: 0,
+            pending_ime_batch: PendingImeBatch::default(),
+            sent_surrounding: None,
             last_ime_cursor_rectangle: None,
             outputs: HashMap::default(),
             in_progress_outputs,
@@ -1026,6 +1244,7 @@ impl WaylandClient {
             primary_data_offer: None,
             cursor,
             pending_activation: None,
+            recent_activation_input: None,
             startup_activation_token,
             event_loop: Some(event_loop),
             ime_enabled: None,
@@ -1705,7 +1924,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandClientStatePtr {
 impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        token: &xdg_activation_token_v1::XdgActivationTokenV1,
+        token_proxy: &xdg_activation_token_v1::XdgActivationTokenV1,
         event: <xdg_activation_token_v1::XdgActivationTokenV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
@@ -1715,6 +1934,13 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
         let mut state = client.borrow_mut();
 
         if let xdg_activation_token_v1::Event::Done { token } = event {
+            if let Some(callback) = take_pending_activation_callback(&mut state.pending_activation)
+            {
+                drop(state);
+                callback(Some(token));
+                token_proxy.destroy();
+                return;
+            }
             let executor = state.common.background_executor.clone();
             match state.pending_activation.take() {
                 Some(PendingActivation::Uri(uri)) => open_uri_internal(executor, &uri, Some(token)),
@@ -1728,11 +1954,14 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
                     let activation = state.globals.activation.as_ref().unwrap();
                     activation.activate(token, &window.surface());
                 }
+                Some(PendingActivation::Callback(_)) => {
+                    unreachable!("callback variant handled before dispatch")
+                }
                 None => log::error!("activation token received with no pending activation"),
             }
         }
 
-        token.destroy();
+        token_proxy.destroy();
     }
 }
 
@@ -1847,6 +2076,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 this.handle_keyboard_layout_change();
             }
             wl_keyboard::Event::Enter { surface, .. } => {
+                state.ime_generation = state.ime_generation.wrapping_add(1);
+                state.pending_ime_batch = PendingImeBatch::default();
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
 
@@ -1856,6 +2087,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 }
             }
             wl_keyboard::Event::Leave { surface, .. } => {
+                state.ime_generation = state.ime_generation.wrapping_add(1);
+                state.pending_ime_batch = PendingImeBatch::default();
+                state.sent_surrounding = None;
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.keyboard_focused_window = None;
                 state.enter_token.take();
@@ -1912,6 +2146,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 if key_state == wl_keyboard::KeyState::Pressed {
                     state.serial_tracker.update(SerialKind::KeyPress, serial);
+                    if let Some(window) = state.keyboard_focused_window.as_ref() {
+                        state.recent_activation_input = Some(RecentActivationInput {
+                            recorded_at: Instant::now(),
+                            serial: state.serial_tracker.get(SerialKind::KeyPress),
+                            surface: window.surface().id(),
+                        });
+                    }
                 }
 
                 let focused_window = state.keyboard_focused_window.clone();
@@ -2046,6 +2287,8 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
         let mut state = client.borrow_mut();
         match event {
             zwp_text_input_v3::Event::Enter { .. } => {
+                state.ime_generation = state.ime_generation.wrapping_add(1);
+                state.pending_ime_batch = PendingImeBatch::default();
                 drop(state);
                 this.enable_ime();
             }
@@ -2053,58 +2296,54 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                 drop(state);
                 this.disable_ime();
             }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } => {
+                state.pending_ime_batch.generation = state.ime_generation;
+                state.pending_ime_batch.delete = Some((before_length, after_length));
+            }
             zwp_text_input_v3::Event::CommitString { text } => {
-                state.composing = false;
-                let Some(window) = state.keyboard_focused_window.clone() else {
-                    return;
-                };
-
-                if let Some(commit_text) = text {
-                    drop(state);
-                    // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
-                    // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
-                    if commit_text.len() == 1 {
-                        window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
-                            keystroke: Keystroke {
-                                modifiers: Modifiers::default(),
-                                key: commit_text.clone(),
-                                key_char: Some(commit_text),
-                            },
-                            is_held: false,
-                            prefer_character_input: false,
-                        }));
-                    } else {
-                        window.handle_ime(ImeInput::InsertText(commit_text));
-                    }
-                }
+                state.pending_ime_batch.generation = state.ime_generation;
+                state.pending_ime_batch.commit = text;
             }
             zwp_text_input_v3::Event::PreeditString { text, .. } => {
-                state.composing = true;
-                state.ime_pre_edit = text;
+                state.pending_ime_batch.generation = state.ime_generation;
+                state.pending_ime_batch.preedit = Some(text.unwrap_or_default());
             }
             zwp_text_input_v3::Event::Done { serial } => {
-                let last_serial = state.serial_tracker.get(SerialKind::InputMethod);
                 state.serial_tracker.update(SerialKind::InputMethod, serial);
+                let batch = std::mem::take(&mut state.pending_ime_batch);
+                if batch.generation != state.ime_generation {
+                    return;
+                }
+                let delete_utf16 = match batch.delete {
+                    Some((before, after)) => {
+                        let Some(sent) = state.sent_surrounding.as_ref() else {
+                            return;
+                        };
+                        let Some(range) = delete_range_utf16(sent, before, after) else {
+                            return;
+                        };
+                        Some(range)
+                    }
+                    None => None,
+                };
+                state.composing = batch.preedit.as_ref().is_some_and(|text| !text.is_empty());
                 let Some(window) = state.keyboard_focused_window.clone() else {
                     return;
                 };
-
-                if let Some(text) = state.ime_pre_edit.take() {
-                    drop(state);
-                    window.handle_ime(ImeInput::SetMarkedText(text));
-                    if let Some(area) = window.get_ime_area() {
-                        let mut state = client.borrow_mut();
-                        set_ime_cursor_rectangle_after_done(
-                            text_input,
-                            &mut state.last_ime_cursor_rectangle,
-                            area,
-                            last_serial.as_raw() == serial,
-                        );
-                    }
-                } else {
-                    state.composing = false;
-                    drop(state);
-                    window.handle_ime(ImeInput::DeleteText);
+                drop(state);
+                window.handle_ime(ImeInput::Batch {
+                    delete_utf16,
+                    commit: batch.commit,
+                    preedit: batch.preedit,
+                });
+                if let Some(area) = window.get_ime_area() {
+                    let mut state = client.borrow_mut();
+                    state.last_ime_cursor_rectangle = Some(area.into());
+                    set_ime_cursor_rectangle(text_input, area.into());
+                    text_input.commit();
                 }
             }
             _ => {}
@@ -2269,6 +2508,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 // interactive moves) are declined when given a release serial.
                 if button_state == wl_pointer::ButtonState::Pressed {
                     state.serial_tracker.update(SerialKind::MousePress, serial);
+                    if let Some(window) = state.mouse_focused_window.as_ref() {
+                        state.recent_activation_input = Some(RecentActivationInput {
+                            recorded_at: Instant::now(),
+                            serial: state.serial_tracker.get(SerialKind::MousePress),
+                            surface: window.surface().id(),
+                        });
+                    }
                 }
                 let button = linux_button_to_gpui(button);
                 let Some(button) = button else { return };
@@ -2983,6 +3229,41 @@ mod tests {
     }
 
     #[test]
+    fn surrounding_context_rebases_reversed_utf16_selection_and_emoji() {
+        let text = "a😀bc".to_string();
+        let selection = gpui::UTF16Selection {
+            range: 1..4,
+            reversed: true,
+        };
+        let (sent, anchor) = bounded_surrounding(text, 0, &selection).unwrap();
+        assert_eq!(sent.text, "a😀bc");
+        assert_eq!(sent.cursor_byte, 1);
+        assert_eq!(anchor, 6);
+        assert_eq!(delete_range_utf16(&sent, 1, 4), Some(0..3));
+        assert_eq!(delete_range_utf16(&sent, 0, 1), None);
+    }
+
+    #[test]
+    fn surrounding_context_is_utf8_bounded_without_splitting_scalars() {
+        let text = format!("{}😀{}", "x".repeat(3000), "y".repeat(3000));
+        let selection = gpui::UTF16Selection {
+            range: 3002..3002,
+            reversed: false,
+        };
+        let (sent, _) = bounded_surrounding(text, 0, &selection).unwrap();
+        assert!(sent.text.len() <= MAX_SURROUNDING_BYTES);
+        assert!(sent.text.is_char_boundary(sent.cursor_byte));
+        assert!(sent.text.contains('😀'));
+    }
+
+    #[test]
+    fn utf16_conversion_rejects_surrogate_splits() {
+        assert_eq!(utf16_to_byte("😀", 0), Some(0));
+        assert_eq!(utf16_to_byte("😀", 1), None);
+        assert_eq!(utf16_to_byte("😀", 2), Some(4));
+    }
+
+    #[test]
     fn builds_terminated_uri_list_for_each_dragged_path() {
         let paths = FileDragPaths::new([
             (PathBuf::from("/tmp/first"), false),
@@ -3075,6 +3356,46 @@ mod tests {
         assert_eq!(
             text_input.cursor_rectangles.borrow().as_slice(),
             &[(10, 20, 1, 18)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod activation_tests {
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        ACTIVATION_INPUT_MAX_AGE, PendingActivation, activation_input_is_eligible,
+        take_pending_activation_callback,
+    };
+
+    #[test]
+    fn fresh_input_requires_the_exact_surface_and_expires() {
+        assert!(activation_input_is_eligible(Instant::now(), true));
+        assert!(!activation_input_is_eligible(Instant::now(), false));
+        assert!(!activation_input_is_eligible(
+            Instant::now() - ACTIVATION_INPUT_MAX_AGE - Duration::from_millis(1),
+            true,
+        ));
+    }
+
+    #[test]
+    fn callback_receives_the_exact_token_once() {
+        let delivered = Rc::new(RefCell::new(Vec::new()));
+        let capture = delivered.clone();
+        let mut pending = Some(PendingActivation::Callback(Box::new(move |token| {
+            capture.borrow_mut().push(token);
+        })));
+        let callback = take_pending_activation_callback(&mut pending).expect("pending callback");
+        callback(Some("exact-token".to_string()));
+        assert!(take_pending_activation_callback(&mut pending).is_none());
+        assert_eq!(
+            delivered.borrow().as_slice(),
+            &[Some("exact-token".to_string())]
         );
     }
 }

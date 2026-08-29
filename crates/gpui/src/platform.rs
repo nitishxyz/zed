@@ -89,6 +89,13 @@ pub use threaded_dispatcher::ThreadedDispatcher;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
 
+fn wayland_endpoint_configured(
+    display: Option<&std::ffi::OsStr>,
+    socket: Option<&std::ffi::OsStr>,
+) -> bool {
+    display.is_some_and(|value| !value.is_empty()) || socket.is_some_and(|value| !value.is_empty())
+}
+
 // TODO(jk): return an enum instead of a string
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor.
@@ -101,15 +108,21 @@ pub fn guess_compositor() -> &'static str {
 
     #[cfg(feature = "wayland")]
     let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    #[cfg(feature = "wayland")]
+    let wayland_socket = std::env::var_os("WAYLAND_SOCKET");
     #[cfg(not(feature = "wayland"))]
-    let wayland_display: Option<std::ffi::OsString> = None;
+    let (wayland_display, wayland_socket): (
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    ) = (None, None);
 
     #[cfg(feature = "x11")]
     let x11_display = std::env::var_os("DISPLAY");
     #[cfg(not(feature = "x11"))]
     let x11_display: Option<std::ffi::OsString> = None;
 
-    let use_wayland = wayland_display.is_some_and(|display| !display.is_empty());
+    let use_wayland =
+        wayland_endpoint_configured(wayland_display.as_deref(), wayland_socket.as_deref());
     let use_x11 = x11_display.is_some_and(|display| !display.is_empty());
 
     if use_wayland {
@@ -823,6 +836,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Activates this window with an authority token supplied by the caller.
+    /// Platforms without token-based activation deliberately do nothing.
+    fn activate_with_token(&self, _token: String) {}
+    /// Requests one fresh activation token bound to recent physical input on
+    /// this window. The callback receives `None` when authority is unavailable.
+    fn request_activation_token(&self, callback: Box<dyn FnOnce(Option<String>)>) {
+        callback(None);
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
@@ -1513,6 +1534,12 @@ impl PlatformInputHandler {
     }
 
     #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn apply_ime_text_batch(&mut self, batch: ImeTextBatch) {
+        self.cx
+            .update(|window, cx| self.handler.apply_ime_text_batch(batch, window, cx))
+            .ok();
+    }
+
     pub fn unmark_text(&mut self) {
         self.cx
             .update(|window, cx| self.handler.unmark_text(window, cx))
@@ -1620,6 +1647,12 @@ impl PlatformInputHandler {
             .flatten()
     }
 
+    pub fn text_input_purpose(&mut self) -> TextInputPurpose {
+        self.cx
+            .update(|window, cx| self.handler.text_input_purpose(window, cx))
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     pub fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
         self.handler.accepts_text_input(window, cx)
@@ -1658,6 +1691,46 @@ pub struct UTF16Selection {
     /// Whether the head of this selection is at the start (true), or end (false)
     /// of the range
     pub reversed: bool,
+}
+
+/// Semantic type of text accepted by an input handler. Platforms use this to
+/// configure virtual keyboards and input methods without changing insertion
+/// behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextInputPurpose {
+    #[default]
+    /// General text.
+    Normal,
+    /// Search query.
+    Search,
+    /// Email address.
+    Email,
+    /// URL.
+    Url,
+    /// Numeric input.
+    Number,
+    /// Terminal input.
+    Terminal,
+    /// Secret password.
+    Password,
+}
+
+impl TextInputPurpose {
+    /// Whether surrounding text must not be exposed to the input method.
+    pub fn is_sensitive(self) -> bool {
+        matches!(self, Self::Password)
+    }
+}
+
+/// One text-input protocol transaction, applied in delete, commit, preedit order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImeTextBatch {
+    /// Absolute UTF-16 range to delete before insertion.
+    pub delete_utf16: Option<Range<usize>>,
+    /// Final text to insert through the normal text insertion path.
+    pub commit: Option<String>,
+    /// New marked text; an empty string cancels the current marked text.
+    pub preedit: Option<String>,
 }
 
 /// Zed's interface for handling text input from the platform's IME system
@@ -1721,6 +1794,19 @@ pub trait InputHandler: 'static {
         cx: &mut App,
     );
 
+    /// Apply a complete platform text-input transaction without exposing partial state.
+    fn apply_ime_text_batch(&mut self, batch: ImeTextBatch, window: &mut Window, cx: &mut App) {
+        if let Some(range) = batch.delete_utf16 {
+            self.replace_text_in_range(Some(range), "", window, cx);
+        }
+        if let Some(text) = batch.commit {
+            self.replace_text_in_range(None, &text, window, cx);
+        }
+        if let Some(text) = batch.preedit {
+            self.replace_and_mark_text_in_range(None, &text, None, window, cx);
+        }
+    }
+
     /// Remove the IME 'composing' state from the document
     /// Corresponds to [unmarkText()](https://developer.apple.com/documentation/appkit/nstextinputclient/1438239-unmarktext)
     fn unmark_text(&mut self, window: &mut Window, cx: &mut App);
@@ -1776,6 +1862,11 @@ pub trait InputHandler: 'static {
     /// Get the length of the document in UTF-16 characters, if known.
     fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut App) -> Option<usize> {
         None
+    }
+
+    /// Semantic purpose of this input context.
+    fn text_input_purpose(&mut self, _window: &mut Window, _cx: &mut App) -> TextInputPurpose {
+        TextInputPurpose::Normal
     }
 
     /// Allows a given input context to opt into getting raw key repeats instead of
@@ -2756,6 +2847,15 @@ mod image_tests {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn inherited_wayland_socket_selects_wayland_without_a_display_name() {
+        assert!(wayland_endpoint_configured(
+            None,
+            Some(std::ffi::OsStr::new("45")),
+        ));
+        assert!(!wayland_endpoint_configured(None, None));
+    }
 
     #[test]
     fn test_window_button_layout_parse_standard() {

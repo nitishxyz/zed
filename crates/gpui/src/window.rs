@@ -5892,6 +5892,19 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// Brings this window to the foreground using an exact, externally issued
+    /// activation token. The token is consumed by the platform implementation.
+    pub fn activate_window_with_token(&self, token: String) {
+        self.platform_window.activate_with_token(token);
+    }
+
+    /// Requests one fresh compositor activation token for recent physical
+    /// input delivered to this window.
+    pub fn request_activation_token(&self, callback: impl FnOnce(Option<String>) + 'static) {
+        self.platform_window
+            .request_activation_token(Box::new(callback));
+    }
+
     /// Requests that the operating system draw attention to this window.
     pub fn request_attention(&self) {
         self.platform_window.request_attention();

@@ -1,4 +1,7 @@
-use crate::{App, Bounds, Context, Entity, InputHandler, Pixels, UTF16Selection, Window};
+use crate::{
+    App, Bounds, Context, Entity, ImeTextBatch, InputHandler, Pixels, TextInputPurpose,
+    UTF16Selection, Window,
+};
 use std::ops::Range;
 
 /// Implement this trait to allow views to handle textual input when implementing an editor, field, etc.
@@ -31,6 +34,24 @@ pub trait EntityInputHandler: 'static + Sized {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Range<usize>>;
+
+    /// See [`InputHandler::apply_ime_text_batch`] for details.
+    fn apply_ime_text_batch(
+        &mut self,
+        batch: ImeTextBatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(range) = batch.delete_utf16 {
+            self.replace_text_in_range(Some(range), "", window, cx);
+        }
+        if let Some(text) = batch.commit {
+            self.replace_text_in_range(None, &text, window, cx);
+        }
+        if let Some(text) = batch.preedit {
+            self.replace_and_mark_text_in_range(None, &text, None, window, cx);
+        }
+    }
 
     /// See [`InputHandler::unmark_text`] for details
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>);
@@ -87,6 +108,15 @@ pub trait EntityInputHandler: 'static + Sized {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+
+    /// See [`InputHandler::text_input_purpose`] for details.
+    fn text_input_purpose(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> TextInputPurpose {
+        TextInputPurpose::Normal
     }
 
     /// See [`InputHandler::accepts_text_input`] for details
@@ -174,6 +204,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         });
     }
 
+    fn apply_ime_text_batch(&mut self, batch: ImeTextBatch, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, cx| view.apply_ime_text_batch(batch, window, cx));
+    }
+
     fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
         self.view
             .update(cx, |view, cx| view.unmark_text(window, cx));
@@ -219,6 +254,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
     fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
         self.view
             .update(cx, |view, cx| view.text_length_utf16(window, cx))
+    }
+
+    fn text_input_purpose(&mut self, window: &mut Window, cx: &mut App) -> TextInputPurpose {
+        self.view
+            .update(cx, |view, cx| view.text_input_purpose(window, cx))
     }
 
     fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {

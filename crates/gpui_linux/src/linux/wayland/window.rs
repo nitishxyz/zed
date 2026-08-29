@@ -33,11 +33,11 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DmabufTextureDescriptor,
-    ExternalDragPayload, ExternalTexture, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
+    ExternalDragPayload, ExternalTexture, GpuSpecs, ImeTextBatch, Modifiers, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowKind, WindowParams,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, TextInputPurpose, Tiling,
+    UTF16Selection, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -676,6 +676,19 @@ pub enum ImeInput {
     SetMarkedText(String),
     UnmarkText,
     DeleteText,
+    Batch {
+        delete_utf16: Option<std::ops::Range<usize>>,
+        commit: Option<String>,
+        preedit: Option<String>,
+    },
+}
+
+pub struct ImeContext {
+    pub text: String,
+    pub actual_range_utf16: std::ops::Range<usize>,
+    pub selection: UTF16Selection,
+    pub purpose: TextInputPurpose,
+    pub bounds: Option<Bounds<Pixels>>,
 }
 
 impl Drop for WaylandWindow {
@@ -1243,9 +1256,46 @@ impl WaylandWindowStatePtr {
                         input_handler.replace_text_in_range(Some(marked), "");
                     }
                 }
+                ImeInput::Batch {
+                    delete_utf16,
+                    commit,
+                    preedit,
+                } => input_handler.apply_ime_text_batch(ImeTextBatch {
+                    delete_utf16,
+                    commit,
+                    preedit,
+                }),
             }
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
+    }
+
+    pub fn get_ime_context(&self) -> Option<ImeContext> {
+        let Ok(mut state) = self.state.try_borrow_mut() else {
+            return None;
+        };
+        let mut input_handler = state.input_handler.take()?;
+        drop(state);
+        let result = (|| {
+            let selection = input_handler.selected_text_range(true)?;
+            let purpose = input_handler.text_input_purpose();
+            let length = input_handler.text_length_utf16()?;
+            let start = selection.range.start.saturating_sub(4096);
+            let end = length.min(selection.range.end.saturating_add(4096));
+            let mut actual = None;
+            let text = input_handler.text_for_range(start..end, &mut actual)?;
+            Some(ImeContext {
+                text,
+                actual_range_utf16: actual.unwrap_or(start..end),
+                selection,
+                purpose,
+                bounds: input_handler.ime_candidate_bounds(),
+            })
+        })();
+        if let Ok(mut state) = self.state.try_borrow_mut() {
+            state.input_handler = Some(input_handler);
+        }
+        result
     }
 
     pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {
@@ -1586,6 +1636,20 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn activate_with_token(&self, token: String) {
+        let state = self.borrow();
+        if let Some(activation) = &state.globals.activation {
+            activation.activate(token, &state.surface);
+        }
+    }
+
+    fn request_activation_token(&self, callback: Box<dyn FnOnce(Option<String>)>) {
+        let state = self.borrow();
+        state
+            .client
+            .request_activation_token(&state.surface, callback);
+    }
+
     fn request_attention(&self) {}
 
     fn is_active(&self) -> bool {
@@ -1898,11 +1962,14 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
-        let state = self.borrow();
-        if !state.active {
-            return;
-        }
-        state.client.update_ime_position(bounds);
+        let client = {
+            let state = self.borrow();
+            if !state.active {
+                return;
+            }
+            state.client.clone()
+        };
+        client.update_ime_position(bounds);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
