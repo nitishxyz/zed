@@ -145,7 +145,16 @@ impl LinuxCommon {
         let (wake_sender, wake_receiver) = calloop::channel::channel();
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
-        let text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
+        let text_system = {
+            let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .into_iter()
+                .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+                .unwrap_or_else(|| "en-US".to_string());
+            Arc::new(crate::linux::CosmicTextSystem::new_with_locale(
+                "Noto Sans",
+                &locale,
+            ))
+        };
         #[cfg(not(any(feature = "wayland", feature = "x11")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 

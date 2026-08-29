@@ -50,6 +50,7 @@ struct CosmicTextSystemState {
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
+    locale: String,
 }
 
 struct LoadedFont {
@@ -63,7 +64,15 @@ struct LoadedFont {
 
 impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
+        let locale = normalized_locale_from_environment();
+        Self::new_with_locale(system_font_fallback, &locale)
+    }
+
+    pub fn new_with_locale(system_font_fallback: &str, locale: &str) -> Self {
+        let locale = normalize_locale(locale);
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_system_fonts();
+        let font_system = FontSystem::new_with_locale_and_db(locale.clone(), db);
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,
@@ -72,6 +81,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            locale,
         }))
     }
 
@@ -88,6 +98,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            locale: "en-US".to_string(),
         }))
     }
 }
@@ -224,6 +235,16 @@ impl CosmicTextSystemState {
         features: &FontFeatures,
         fallbacks: Option<&FontFallbacks>,
     ) -> Result<SmallVec<[FontId; 4]>> {
+        self.load_family_internal(name, features, fallbacks, true)
+    }
+
+    fn load_family_internal(
+        &mut self,
+        name: &str,
+        features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
+        append_safety: bool,
+    ) -> Result<SmallVec<[FontId; 4]>> {
         // recurse with `fallbacks = None` so a fallback family cannot pull in
         // another chain. missing fallback families are dropped so a typo in
         // settings still lets the primary family load.
@@ -239,7 +260,8 @@ impl CosmicTextSystemState {
                     let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
                         cached.clone()
                     } else {
-                        let loaded = self.load_family(fallback_name, features, None)?;
+                        let loaded =
+                            self.load_family_internal(fallback_name, features, None, false)?;
                         self.font_ids_by_family_cache
                             .insert(fb_key.clone(), loaded.clone());
                         loaded
@@ -258,6 +280,30 @@ impl CosmicTextSystemState {
             }
             _ => Arc::from(Vec::new()),
         };
+        let mut fallback_chain = user_fallback_chain.to_vec();
+        if append_safety {
+            for family in safety_fallback_families(&self.locale) {
+                if family == name
+                    || fallback_chain
+                        .iter()
+                        .any(|(_, present)| present.as_ref() == family)
+                {
+                    continue;
+                }
+                let key = FontKey::new(SharedString::from(family), features.clone(), None);
+                let ids = if let Some(ids) = self.font_ids_by_family_cache.get(&key) {
+                    ids.clone()
+                } else {
+                    let ids = self.load_family_internal(family, features, None, false)?;
+                    self.font_ids_by_family_cache.insert(key, ids.clone());
+                    ids
+                };
+                if let Some(&id) = ids.first() {
+                    fallback_chain.push((id, SharedString::from(family)));
+                }
+            }
+        }
+        let user_fallback_chain: Arc<[(FontId, SharedString)]> = Arc::from(fallback_chain);
 
         let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
 
@@ -293,10 +339,11 @@ impl CosmicTextSystemState {
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
+            let is_known_emoji_font = check_is_known_emoji_font(font.as_swash(), &postscript_name);
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_known_emoji_font,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
         }
@@ -434,10 +481,12 @@ impl CosmicTextSystemState {
                 .context("fallback font face not found in cosmic-text database")?;
 
             let font_id = FontId(self.loaded_fonts.len());
+            let is_known_emoji_font =
+                check_is_known_emoji_font(font.as_swash(), &face.post_script_name);
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                is_known_emoji_font,
                 user_fallback_chain: Arc::from(Vec::new()),
             });
 
@@ -675,6 +724,18 @@ impl CosmicTextSystemState {
                 }
             }
             let is_emoji = loaded_font.is_known_emoji_font;
+            if log::log_enabled!(target: "gpui::font_fallback", log::Level::Trace)
+                && let Some(face) = self.font_system.db().face(loaded_font.font.id())
+            {
+                log::trace!(
+                    target: "gpui::font_fallback",
+                    "family={:?} postscript={:?} glyph={} source={}",
+                    face.families.first().map(|family| family.0.as_str()),
+                    face.post_script_name,
+                    glyph.glyph_id,
+                    if is_emoji { "color-or-emoji-outline" } else { "outline" },
+                );
+            }
 
             // HACK: Prevent crash caused by variation selectors.
             if glyph.glyph_id == 3 && is_emoji {
@@ -710,6 +771,73 @@ impl CosmicTextSystemState {
             len: text.len(),
         }
     }
+}
+
+fn normalize_locale(locale: &str) -> String {
+    let locale = locale
+        .split('.')
+        .next()
+        .unwrap_or(locale)
+        .split('@')
+        .next()
+        .unwrap_or(locale);
+    let locale = locale.replace('_', "-");
+    if locale.is_empty() || locale == "C" || locale == "POSIX" {
+        "en-US".to_string()
+    } else {
+        locale
+    }
+}
+
+fn normalized_locale_from_environment() -> String {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
+        .map_or_else(|| "en-US".to_string(), |locale| normalize_locale(&locale))
+}
+
+fn safety_fallback_families(locale: &str) -> Vec<&'static str> {
+    let language = locale
+        .split('-')
+        .next()
+        .unwrap_or("en")
+        .to_ascii_lowercase();
+    let mut families = vec!["Noto Sans", "DejaVu Sans"];
+    match language.as_str() {
+        "ja" => families.extend([
+            "Noto Sans CJK JP",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK TC",
+            "Noto Sans CJK HK",
+        ]),
+        "zh" if locale.to_ascii_uppercase().contains("-TW") => families.extend([
+            "Noto Sans CJK TC",
+            "Noto Sans CJK HK",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+        ]),
+        "zh" if locale.to_ascii_uppercase().contains("-HK") => families.extend([
+            "Noto Sans CJK HK",
+            "Noto Sans CJK TC",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+        ]),
+        _ => families.extend([
+            "Noto Sans CJK SC",
+            "Noto Sans CJK TC",
+            "Noto Sans CJK JP",
+            "Noto Sans CJK HK",
+        ]),
+    }
+    families.extend([
+        "Noto Sans Arabic",
+        "Noto Naskh Arabic",
+        "Noto Sans Devanagari",
+        "Noto Color Emoji",
+        "Noto Emoji",
+        "Symbola",
+    ]);
+    families
 }
 
 #[inline(always)]
@@ -866,8 +994,7 @@ fn compute_run_spans(
     let mut span_font_id = primary;
     for (grapheme_idx, grapheme) in run_text.grapheme_indices(true) {
         let abs = run_offset + grapheme_idx;
-        let ch = grapheme.chars().next().unwrap_or('\0');
-        let next_slot = pick_covering_slot(ch, span_slot, primary, fallback_chain, covers);
+        let next_slot = pick_covering_cluster(grapheme, span_slot, primary, fallback_chain, covers);
         if next_slot == span_slot {
             continue;
         }
@@ -905,6 +1032,72 @@ fn slot_font_id(
     }
 }
 
+fn pick_covering_cluster(
+    grapheme: &str,
+    current: Option<usize>,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+    covers: &impl Fn(FontId, char) -> bool,
+) -> Option<usize> {
+    let meaningful: SmallVec<[char; 8]> = grapheme
+        .chars()
+        .filter(|ch| !matches!(*ch as u32, 0x200D | 0xFE0E | 0xFE0F))
+        .collect();
+    if meaningful.is_empty() {
+        return current;
+    }
+    let covers_cluster = |font_id| meaningful.iter().all(|ch| covers(font_id, *ch));
+    if covers_cluster(primary) {
+        return None;
+    }
+
+    let emoji_presentation = grapheme.contains('\u{FE0F}')
+        || grapheme.contains('\u{200D}')
+        || meaningful
+            .iter()
+            .any(|ch| matches!(*ch as u32, 0x1F1E6..=0x1FAFF | 0x20E3));
+    let text_presentation = grapheme.contains('\u{FE0E}');
+    let mut slots: SmallVec<[usize; 16]> = (0..fallback_chain.len()).collect();
+    if emoji_presentation && !text_presentation {
+        slots.sort_by_key(|slot| {
+            let name = fallback_chain[*slot].1.to_ascii_lowercase();
+            if name.contains("color emoji") {
+                0
+            } else if name.contains("emoji") {
+                1
+            } else {
+                2
+            }
+        });
+    }
+    if let Some(slot) = slots
+        .iter()
+        .copied()
+        .find(|slot| covers_cluster(fallback_chain[*slot].0))
+    {
+        return Some(slot);
+    }
+
+    // A complex sequence may not be fully represented in any charmap. Keep it
+    // in one shaping span and choose the face covering the most meaningful
+    // scalars rather than allowing per-codepoint .notdef churn.
+    slots
+        .into_iter()
+        .max_by_key(|slot| {
+            meaningful
+                .iter()
+                .filter(|ch| covers(fallback_chain[*slot].0, **ch))
+                .count()
+        })
+        .filter(|slot| {
+            meaningful
+                .iter()
+                .any(|ch| covers(fallback_chain[*slot].0, *ch))
+        })
+        .or(current)
+}
+
+#[cfg(test)]
 fn pick_covering_slot(
     ch: char,
     current: Option<usize>,
@@ -988,9 +1181,13 @@ fn face_info_into_properties(
     }
 }
 
-fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+fn check_is_known_emoji_font(font: swash::FontRef<'_>, postscript_name: &str) -> bool {
+    use swash::tag_from_bytes;
+    let has_color_source = [b"COLR", b"CBDT", b"sbix", b"SVG "]
+        .iter()
+        .any(|tag| font.table(tag_from_bytes(tag)).is_some());
+    let normalized_name = postscript_name.to_ascii_lowercase();
+    has_color_source || normalized_name.contains("emoji")
 }
 
 #[cfg(test)]
@@ -1397,6 +1594,55 @@ mod tests {
         let text = "字字字";
         let spans = compute_run_spans(text, 0, text.len(), primary, &fb, &covers);
         assert_eq!(spans.as_slice(), &[span(0, text.len(), Some(0), fid(1))]);
+    }
+
+    #[test]
+    fn locale_policy_orders_cjk_without_dropping_latin_or_emoji() {
+        let ja = safety_fallback_families("ja-JP");
+        assert_eq!(&ja[..3], &["Noto Sans", "DejaVu Sans", "Noto Sans CJK JP"]);
+        assert!(
+            ja.iter().position(|name| *name == "Noto Color Emoji")
+                < ja.iter().position(|name| *name == "Noto Emoji")
+        );
+        let tc = safety_fallback_families("zh-TW");
+        assert!(
+            tc.iter().position(|name| *name == "Noto Sans CJK TC")
+                < tc.iter().position(|name| *name == "Noto Sans CJK SC")
+        );
+    }
+
+    #[test]
+    fn emoji_clusters_select_one_complete_color_span() {
+        let primary = fid(0);
+        let fallback: SmallVec<[(FontId, SharedString); 4]> = SmallVec::from_vec(vec![
+            (fid(1), SharedString::from("Noto Sans")),
+            (fid(2), SharedString::from("Noto Color Emoji")),
+        ]);
+        let covers = |id: FontId, ch: char| id == fid(2) && ch != '\u{200D}';
+        for cluster in ["1️⃣", "👩🏽‍💻", "👨‍👩‍👧‍👦", "🇯🇵"] {
+            assert_eq!(
+                pick_covering_cluster(cluster, None, primary, &fallback, &covers),
+                Some(1)
+            );
+        }
+    }
+
+    #[test]
+    fn variation_selector_fifteen_does_not_force_emoji_priority() {
+        let primary = fid(0);
+        let fallback: SmallVec<[(FontId, SharedString); 4]> = SmallVec::from_vec(vec![
+            (fid(1), SharedString::from("Noto Sans")),
+            (fid(2), SharedString::from("Noto Color Emoji")),
+        ]);
+        let covers = |id: FontId, ch: char| ch == '☺' && matches!(id.0, 1 | 2);
+        assert_eq!(
+            pick_covering_cluster("☺︎", None, primary, &fallback, &covers),
+            Some(0)
+        );
+        assert_eq!(
+            pick_covering_cluster("☺️", None, primary, &fallback, &covers),
+            Some(1)
+        );
     }
 
     #[test]
