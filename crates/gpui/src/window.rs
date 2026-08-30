@@ -695,7 +695,10 @@ impl<M: Focusable + EventEmitter<DismissEvent> + Render> ManagedView for M {}
 /// Emitted by implementers of [`ManagedView`] to indicate the view should be dismissed, such as when a view is presented as a modal.
 pub struct DismissEvent;
 
-type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
+struct FrameCallback {
+    callback: Box<dyn FnOnce(&mut Window, &mut App)>,
+    requires_presentation: bool,
+}
 
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
@@ -1729,9 +1732,19 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                //
+                // Presentation-sensitive callbacks opt out for their next frame.
+                // This lets short, intentional motion remain fluid without globally
+                // exempting inactive windows from frame-rate throttling.
+                let callbacks = next_frame_callbacks.borrow();
+                let requires_presentation = callbacks
+                    .iter()
+                    .any(|callback| callback.requires_presentation);
+                let callbacks_pending = !callbacks.is_empty();
+                drop(callbacks);
                 let min_frame_interval = if request_frame_options.require_presentation
-                    || (!request_frame_options.force_render
-                        && next_frame_callbacks.borrow().is_empty())
+                    || requires_presentation
+                    || (!request_frame_options.force_render && !callbacks_pending)
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
@@ -1771,7 +1784,7 @@ impl Window {
                     handle
                         .update(&mut cx, |_, window, cx| {
                             for callback in pending_next_frame_callbacks {
-                                callback(window, cx);
+                                (callback.callback)(window, cx);
                             }
                         })
                         .log_err();
@@ -2509,7 +2522,32 @@ impl Window {
 
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
-        RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.schedule_frame_callback(callback, false);
+    }
+
+    /// Schedule a presentation-sensitive callback for the next rendered frame.
+    ///
+    /// Unlike [`Self::on_next_frame`], this callback temporarily bypasses the
+    /// inactive-window frame-rate cap. Use it for short, intentional motion
+    /// that must remain fluid while its window is visible but unfocused. The
+    /// exemption applies only to the next frame; continuously animated code
+    /// must explicitly request each presentation frame.
+    pub fn on_next_presentation_frame(
+        &self,
+        callback: impl FnOnce(&mut Window, &mut App) + 'static,
+    ) {
+        self.schedule_frame_callback(callback, true);
+    }
+
+    fn schedule_frame_callback(
+        &self,
+        callback: impl FnOnce(&mut Window, &mut App) + 'static,
+        requires_presentation: bool,
+    ) {
+        RefCell::borrow_mut(&self.next_frame_callbacks).push(FrameCallback {
+            callback: Box::new(callback),
+            requires_presentation,
+        });
         // Next-frame callbacks create frame demand without dirtying the
         // window, so the platform's frame source must be woken explicitly.
         self.invalidator.wake_platform();
@@ -2541,7 +2579,7 @@ impl Window {
         let callbacks = self.next_frame_callbacks.take();
         let count = callbacks.len();
         for callback in callbacks {
-            callback(self, cx);
+            (callback.callback)(self, cx);
         }
         count
     }
@@ -7257,6 +7295,29 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
+        );
+    }
+
+    #[gpui::test]
+    fn test_presentation_frame_bypasses_inactive_window_throttle(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, {
+                let callback_ran = callback_ran.clone();
+                move |_, window, _| {
+                    window.on_next_presentation_frame(move |_, _| callback_ran.set(true));
+                }
+            })
+            .unwrap();
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            callback_ran.get(),
+            "presentation frames must bypass the inactive-window throttle"
         );
     }
 
