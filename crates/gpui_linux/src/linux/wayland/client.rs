@@ -23,6 +23,7 @@ use filedescriptor::Pipe;
 use gpui_util::ResultExt as _;
 use http_client::Url;
 use smallvec::SmallVec;
+use uuid::Uuid;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
 use wayland_client::event_created_child;
@@ -99,13 +100,13 @@ use crate::linux::{
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
-    FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NativeDragVisual, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TextInputPurpose, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
-    profiler, px, size,
+    AnyWindowHandle, Bounds, Capslock, CursorStyle, DeferredClipboardImage,
+    DeferredClipboardImageError, DevicePixels, DisplayId, ExternalDragPayload, FileDragPaths,
+    FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NativeDragVisual,
+    NavigationDirection, Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout,
+    PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString, Size, TextInputPurpose,
+    TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -477,7 +478,7 @@ pub struct DragState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataSourceKind {
-    Clipboard,
+    Clipboard(Uuid),
     Drag,
 }
 
@@ -1506,13 +1507,13 @@ impl LinuxClient for WaylandClient {
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
             }
-            data_source.offer(state.clipboard.self_mime());
+            data_source.offer(state.clipboard.primary_self_mime());
             primary_selection.set_selection(Some(&data_source), serial.as_raw());
         }
     }
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
-        let mut state = self.0.borrow_mut();
+        let state = self.0.borrow();
         let (Some(data_device_manager), Some(data_device)) = (
             state.globals.data_device_manager.clone(),
             state.data_device.clone(),
@@ -1520,21 +1521,70 @@ impl LinuxClient for WaylandClient {
             return;
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
-            state.clipboard.set(item);
             let Some(serial) = state.serial_tracker.selection_serial() else {
                 log::warn!(
                     "Skipping Wayland clipboard ownership request because no keyboard or pointer press serial has been received"
                 );
                 return;
             };
+            let source_id = Uuid::new_v4();
+            state.clipboard.set(source_id, item);
             let data_source = data_device_manager
-                .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
-            for mime_type in TEXT_MIME_TYPES {
+                .create_data_source(&state.globals.qh, DataSourceKind::Clipboard(source_id));
+            for mime_type in state.clipboard.offered_mime_types(source_id) {
                 data_source.offer(mime_type.to_string());
             }
-            data_source.offer(state.clipboard.self_mime());
+            data_source.offer(state.clipboard.self_mime(source_id));
             data_device.set_selection(Some(&data_source), serial.as_raw());
         }
+    }
+
+    fn begin_deferred_image_clipboard(
+        &self,
+    ) -> Result<DeferredClipboardImage, DeferredClipboardImageError> {
+        let state = self.0.borrow();
+        let (Some(data_device_manager), Some(data_device)) = (
+            state.globals.data_device_manager.clone(),
+            state.data_device.clone(),
+        ) else {
+            return Err(DeferredClipboardImageError::Unavailable);
+        };
+        if state.mouse_focused_window.is_none() && state.keyboard_focused_window.is_none() {
+            return Err(DeferredClipboardImageError::Unavailable);
+        }
+        let Some(serial) = state.serial_tracker.selection_serial() else {
+            return Err(DeferredClipboardImageError::Unavailable);
+        };
+
+        let source = DeferredClipboardImage::create();
+        let source_id = source.uuid();
+        state.clipboard.begin_deferred(source_id);
+        let data_source = data_device_manager
+            .create_data_source(&state.globals.qh, DataSourceKind::Clipboard(source_id));
+        for mime_type in state.clipboard.offered_mime_types(source_id) {
+            data_source.offer(mime_type.to_string());
+        }
+        data_source.offer(state.clipboard.self_mime(source_id));
+        data_device.set_selection(Some(&data_source), serial.as_raw());
+        Ok(source)
+    }
+
+    fn fulfill_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+        png_bytes: Vec<u8>,
+    ) -> Result<(), DeferredClipboardImageError> {
+        self.0
+            .borrow()
+            .clipboard
+            .fulfill_deferred(source.into_uuid(), png_bytes)
+    }
+
+    fn fail_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+    ) -> Result<(), DeferredClipboardImageError> {
+        self.0.borrow().clipboard.fail_deferred(source.into_uuid())
     }
 
     fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
@@ -3060,10 +3110,14 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
         let mut state = client.borrow_mut();
 
         match (kind, event) {
-            (DataSourceKind::Clipboard, wl_data_source::Event::Send { mime_type, fd }) => {
-                state.clipboard.send(mime_type, fd);
+            (
+                DataSourceKind::Clipboard(source_id),
+                wl_data_source::Event::Send { mime_type, fd },
+            ) => {
+                state.clipboard.send(*source_id, mime_type, fd);
             }
-            (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
+            (DataSourceKind::Clipboard(source_id), wl_data_source::Event::Cancelled) => {
+                state.clipboard.cancel_source(*source_id);
                 data_source.destroy();
             }
             (DataSourceKind::Drag, wl_data_source::Event::Send { fd, .. }) => {

@@ -45,15 +45,15 @@ use crate::InspectorElementRegistry;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
     ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, FocusMap,
-    ForegroundExecutor, Global, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu,
-    MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
-    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
+    DeferredClipboardImage, DeferredClipboardImageError, DispatchPhase, DisplayId, EventEmitter,
+    ExternalDragPayload, FocusHandle, FocusMap, ForegroundExecutor, Global, KeyBinding, KeyContext,
+    Keymap, Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
+    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
+    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
+    WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -1381,6 +1381,35 @@ impl App {
     /// Writes data to the platform clipboard.
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
         self.platform.write_to_clipboard(item)
+    }
+
+    /// Immediately claims the clipboard with an `image/png` offer to be fulfilled later.
+    ///
+    /// Deferred sources are currently supported by the Linux Wayland backend. Data requests wait
+    /// for fulfillment only for a bounded interval. Fulfillment and failure affect the source
+    /// installed by this call and never reclaim or clear the selection, so any newer copy wins.
+    pub fn begin_deferred_image_clipboard(
+        &self,
+    ) -> std::result::Result<DeferredClipboardImage, DeferredClipboardImageError> {
+        self.platform.begin_deferred_image_clipboard()
+    }
+
+    /// Supplies PNG bytes to a previously installed deferred clipboard source.
+    pub fn fulfill_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+        png_bytes: Vec<u8>,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        self.platform
+            .fulfill_deferred_image_clipboard(source, png_bytes)
+    }
+
+    /// Retires a previously installed deferred clipboard source without supplying data.
+    pub fn fail_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        self.platform.fail_deferred_image_clipboard(source)
     }
 
     /// Reads data from the primary selection buffer.

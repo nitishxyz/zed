@@ -22,11 +22,11 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
-    WindowButtonLayout, WindowParams,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    DeferredClipboardImage, DeferredClipboardImageError, DisplayId, ForegroundExecutor, Keymap,
+    Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result,
+    RunnableVariant, Task, ThermalState, WindowAppearance, WindowButtonLayout, WindowParams,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use gpui::{Pixels, Point, px};
@@ -87,6 +87,24 @@ pub(crate) trait LinuxClient {
     fn reveal_path(&self, path: PathBuf);
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    fn begin_deferred_image_clipboard(
+        &self,
+    ) -> std::result::Result<DeferredClipboardImage, DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
+    fn fulfill_deferred_image_clipboard(
+        &self,
+        _source: DeferredClipboardImage,
+        _png_bytes: Vec<u8>,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
+    fn fail_deferred_image_clipboard(
+        &self,
+        _source: DeferredClipboardImage,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
@@ -742,6 +760,28 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
         self.inner.write_to_clipboard(item)
+    }
+
+    fn begin_deferred_image_clipboard(
+        &self,
+    ) -> std::result::Result<DeferredClipboardImage, DeferredClipboardImageError> {
+        self.inner.begin_deferred_image_clipboard()
+    }
+
+    fn fulfill_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+        png_bytes: Vec<u8>,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        self.inner
+            .fulfill_deferred_image_clipboard(source, png_bytes)
+    }
+
+    fn fail_deferred_image_clipboard(
+        &self,
+        source: DeferredClipboardImage,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        self.inner.fail_deferred_image_clipboard(source)
     }
 
     fn read_from_primary(&self) -> Option<ClipboardItem> {

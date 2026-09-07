@@ -322,6 +322,38 @@ pub trait Platform: 'static {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
 
+    /// Claims the clipboard with an `image/png` offer whose bytes will be supplied later.
+    ///
+    /// Platforms that cannot install a deferred source return
+    /// [`DeferredClipboardImageError::Unsupported`].
+    fn begin_deferred_image_clipboard(
+        &self,
+    ) -> std::result::Result<DeferredClipboardImage, DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
+
+    /// Supplies PNG bytes to the source installed by
+    /// [`Platform::begin_deferred_image_clipboard`].
+    ///
+    /// This must not claim or otherwise change clipboard ownership.
+    fn fulfill_deferred_image_clipboard(
+        &self,
+        _source: DeferredClipboardImage,
+        _png_bytes: Vec<u8>,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
+
+    /// Retires a deferred source without providing image data.
+    ///
+    /// This must not clear or otherwise change clipboard ownership.
+    fn fail_deferred_image_clipboard(
+        &self,
+        _source: DeferredClipboardImage,
+    ) -> std::result::Result<(), DeferredClipboardImageError> {
+        Err(DeferredClipboardImageError::Unsupported)
+    }
+
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -2374,6 +2406,58 @@ pub struct ClipboardItem {
     /// The entries in this clipboard item.
     pub entries: Vec<ClipboardEntry>,
 }
+
+/// An opaque handle to a deferred `image/png` clipboard source.
+///
+/// The handle identifies the source that was installed when the deferred copy began. Supplying
+/// or failing it never installs a new selection. If another application or another copy replaces
+/// the selection, that newer selection wins. A paste offer acquired before replacement can still
+/// complete according to the desktop compositor's normal event ordering.
+#[derive(Debug)]
+pub struct DeferredClipboardImage(Uuid);
+
+impl DeferredClipboardImage {
+    #[doc(hidden)]
+    pub fn create() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    #[doc(hidden)]
+    pub fn into_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[doc(hidden)]
+    pub fn uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+/// An error returned by deferred image clipboard operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeferredClipboardImageError {
+    /// The configured platform backend does not implement deferred image clipboard sources.
+    Unsupported,
+    /// The backend cannot claim the clipboard at this time.
+    Unavailable,
+    /// The source was cancelled, failed, fulfilled, or was otherwise already retired.
+    Retired,
+    /// The supplied bytes are not a PNG image.
+    InvalidPng,
+}
+
+impl fmt::Display for DeferredClipboardImageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unsupported => "deferred image clipboard sources are unsupported",
+            Self::Unavailable => "the clipboard is unavailable",
+            Self::Retired => "the deferred image clipboard source is retired",
+            Self::InvalidPng => "the deferred image clipboard data is not PNG",
+        })
+    }
+}
+
+impl std::error::Error for DeferredClipboardImageError {}
 
 /// Either a ClipboardString or a ClipboardImage
 #[derive(Clone, Debug, Eq, PartialEq)]
