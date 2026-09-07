@@ -35,6 +35,9 @@ pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8
 const DEFERRED_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CLIPBOARD_TRANSFERS: usize = 32;
 const MAX_SOURCE_TRANSFERS: usize = 8;
+const MAX_ENCODED_PNG_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PNG_DIMENSION: u32 = 16_384;
+const MAX_PNG_DECODE_ALLOCATION: u64 = 256 * 1024 * 1024;
 
 pub(crate) struct Clipboard {
     connection: Connection,
@@ -617,15 +620,28 @@ fn queue_source_send<Data: 'static>(
     }
 }
 
+fn is_valid_png(png_bytes: &[u8]) -> bool {
+    if png_bytes.len() > MAX_ENCODED_PNG_BYTES {
+        return false;
+    }
+
+    let mut image_reader =
+        image::ImageReader::with_format(Cursor::new(png_bytes), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_PNG_DIMENSION);
+    limits.max_image_height = Some(MAX_PNG_DIMENSION);
+    limits.max_alloc = Some(MAX_PNG_DECODE_ALLOCATION);
+    image_reader.limits(limits);
+    image_reader.decode().is_ok()
+}
+
 fn fulfill_source<Data: 'static>(
     loop_handle: &LoopHandle<'static, Data>,
     sources: &Rc<RefCell<ClipboardSources>>,
     source_id: Uuid,
     png_bytes: Vec<u8>,
 ) -> Result<(), DeferredClipboardImageError> {
-    let image_reader =
-        image::ImageReader::with_format(Cursor::new(&png_bytes), image::ImageFormat::Png);
-    if image_reader.into_dimensions().is_err() {
+    if !is_valid_png(&png_bytes) {
         fail_source(loop_handle, sources, source_id)?;
         return Err(DeferredClipboardImageError::InvalidPng);
     }
@@ -989,6 +1005,63 @@ mod tests {
         assert!(read_all(read).is_empty());
         assert!(sources.borrow().item(source_id).is_none());
         assert!(sources.borrow().transfers.is_empty());
+    }
+
+    fn first_idat_data_offset(bytes: &[u8]) -> usize {
+        bytes
+            .windows(4)
+            .position(|window| window == b"IDAT")
+            .expect("missing IDAT chunk")
+            + 4
+    }
+
+    fn assert_invalid_png_retires_pending_source(bytes: Vec<u8>) {
+        let event_loop = EventLoop::<()>::try_new().expect("event loop creation failed");
+        let sources = make_source_store();
+        let source_id = Uuid::new_v4();
+        sources.borrow_mut().insert_pending(source_id);
+        let (mut read, write_fd) = pipe_pair();
+        read.set_non_blocking(true)
+            .expect("failed to make read pipe nonblocking");
+        queue_source_send(
+            &event_loop.handle(),
+            &sources,
+            source_id,
+            "image/png",
+            write_fd,
+            DEFERRED_SEND_TIMEOUT,
+        );
+        assert_eq!(sources.borrow().transfers.len(), 1);
+
+        assert_eq!(
+            fulfill_source(&event_loop.handle(), &sources, source_id, bytes),
+            Err(DeferredClipboardImageError::InvalidPng)
+        );
+        assert!(read_all(read).is_empty());
+        assert!(sources.borrow().item(source_id).is_none());
+        assert!(sources.borrow().transfers.is_empty());
+        assert_eq!(
+            fulfill_source(&event_loop.handle(), &sources, source_id, png_bytes(5)),
+            Err(DeferredClipboardImageError::Retired)
+        );
+    }
+
+    #[test]
+    fn corrupt_idat_fails_the_source_and_closes_pending_fds() {
+        let mut bytes = png_bytes(6);
+        let offset = first_idat_data_offset(&bytes);
+        *bytes.get_mut(offset).expect("missing IDAT data") ^= 0xff;
+
+        assert_invalid_png_retires_pending_source(bytes);
+    }
+
+    #[test]
+    fn truncated_idat_fails_the_source_and_closes_pending_fds() {
+        let mut bytes = png_bytes(7);
+        let offset = first_idat_data_offset(&bytes);
+        bytes.truncate(offset + 1);
+
+        assert_invalid_png_retires_pending_source(bytes);
     }
 
     #[test]
