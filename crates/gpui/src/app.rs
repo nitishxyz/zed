@@ -681,9 +681,11 @@ struct PlatformOwnedDrag {
 
 enum PlatformOwnedDragState {
     Suspended(AnyDrag),
-    // A source-window drop consumes `active_drag` before AppKit ends the dragging session, so this
-    // marker can outlive the active drag and is cleaned up by `FileDropEvent::Ended`.
-    RestoredInSourceWindow,
+    // The typed drag is active again because the platform session entered one of this app's
+    // windows. A drop consumes `active_drag` before AppKit ends the dragging session, so this
+    // marker can outlive the active drag and is cleaned up by `FileDropEvent::Ended`, which the
+    // platform delivers to the source window.
+    Restored { window: WindowId },
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
@@ -1846,7 +1848,9 @@ impl App {
                 cx.window_update_stack.pop();
 
                 if window.removed {
-                    cx.end_platform_drag(id);
+                    if !cx.end_platform_drag(id) {
+                        cx.hand_restored_drag_to_platform(id);
+                    }
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
                     if let Some(tracked) = cx.tracked_entities.remove(&id) {
@@ -2481,9 +2485,10 @@ impl App {
 
     pub(crate) fn active_drag_is_platform_owned(&self) -> bool {
         self.active_drag.is_some()
-            && self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
-            })
+            && self
+                .platform_owned_drag
+                .as_ref()
+                .is_some_and(|drag| matches!(&drag.state, PlatformOwnedDragState::Restored { .. }))
     }
 
     /// Gets the cursor style of the currently active drag operation.
@@ -2495,9 +2500,9 @@ impl App {
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
             self.active_drag = None;
+            let window_id = window.window_handle().window_id();
             if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+                matches!(&drag.state, PlatformOwnedDragState::Restored { window } if *window == window_id)
             }) {
                 self.platform_owned_drag = None;
             }
@@ -2519,29 +2524,33 @@ impl App {
         true
     }
 
-    pub(crate) fn restore_platform_drag(&mut self, source_window: WindowId) -> bool {
-        let Some(platform_drag) = self
-            .platform_owned_drag
-            .as_mut()
-            .filter(|drag| drag.source_window == source_window)
-        else {
+    /// Restores a suspended typed drag when its platform session enters any window of this app.
+    ///
+    /// A suspended drag exists only between a successful `start_external_drag` and the platform
+    /// reporting the session's end, and the platform runs one pointer drag session at a time, so a
+    /// platform drag entering one of our windows while a drag is suspended is that session.
+    pub(crate) fn restore_platform_drag(&mut self, window: WindowId) -> bool {
+        let Some(platform_drag) = self.platform_owned_drag.as_mut() else {
             return false;
         };
-        let state = std::mem::replace(
+        match std::mem::replace(
             &mut platform_drag.state,
-            PlatformOwnedDragState::RestoredInSourceWindow,
-        );
-        let PlatformOwnedDragState::Suspended(drag) = state else {
-            return false;
-        };
-        self.active_drag = Some(drag);
-        true
+            PlatformOwnedDragState::Restored { window },
+        ) {
+            PlatformOwnedDragState::Suspended(drag) => {
+                self.active_drag = Some(drag);
+                true
+            }
+            restored => {
+                platform_drag.state = restored;
+                false
+            }
+        }
     }
 
-    pub(crate) fn hand_restored_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_restored_drag_to_platform(&mut self, window: WindowId) -> bool {
         let Some(platform_drag) = self.platform_owned_drag.as_mut().filter(|drag| {
-            drag.source_window == source_window
-                && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+            matches!(&drag.state, PlatformOwnedDragState::Restored { window: restored } if *restored == window)
         }) else {
             return false;
         };

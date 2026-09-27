@@ -5281,8 +5281,9 @@ impl Window {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
                     self.mouse_within_window = true;
-                    let source_window = self.handle.window_id();
-                    if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
+                    if !cx.restore_platform_drag(self.handle.window_id())
+                        && cx.active_drag.is_none()
+                    {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
@@ -7614,70 +7615,247 @@ mod tests {
         ));
     }
 
+    struct FileDrag {
+        window: AnyWindowHandle,
+        observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
+        observed_drops: Rc<RefCell<Vec<PathBuf>>>,
+    }
+
+    fn add_file_drag_window(cx: &mut TestAppContext, path: PathBuf) -> FileDrag {
+        let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
+        let observed_drops = Rc::new(RefCell::new(Vec::new()));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let observed_drag_moves = observed_drag_moves.clone();
+                let observed_drops = observed_drops.clone();
+                move |_, _| FileDragView {
+                    path,
+                    observed_drag_moves,
+                    observed_drops,
+                }
+            })
+            .into();
+        let update_result = cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to draw window: {update_result:?}"
+        );
+        FileDrag {
+            window,
+            observed_drag_moves,
+            observed_drops,
+        }
+    }
+
+    fn start_file_drag(cx: &mut TestAppContext, path: PathBuf, platform_result: bool) -> FileDrag {
+        let drag = add_file_drag_window(cx, path);
+        let window = drag.window;
+        cx.test_window(window)
+            .set_start_external_drag_result(platform_result);
+
+        let update_result = cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: point(px(10.), px(10.)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(20.), px(20.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_some());
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to start drag: {update_result:?}"
+        );
+
+        assert!(cx.test_window(window).external_drag_files().is_empty());
+        drag
+    }
+
+    fn promote_file_drag(cx: &mut TestAppContext, drag: &FileDrag) {
+        let update_result = cx.update_window(drag.window, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(-1.), px(20.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        });
+        assert!(
+            update_result.is_ok(),
+            "failed to promote drag: {update_result:?}"
+        );
+    }
+
+    fn dispatch_file_drop(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        event: FileDropEvent,
+    ) -> Option<(bool, bool)> {
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(event.to_platform_input(), cx);
+            cx.active_drag.as_ref().map(|drag| {
+                (
+                    drag.value.downcast_ref::<PathBuf>().is_some(),
+                    drag.value.downcast_ref::<ExternalPaths>().is_some(),
+                )
+            })
+        })
+        .expect("window should exist")
+    }
+
+    /// A typed drag handed to the platform is restored when the platform session enters any window
+    /// of the app, not only its source window, so drop targets there receive the original payload.
+    #[gpui::test]
+    fn platform_owned_file_drag_restores_typed_payload_in_other_app_windows(
+        cx: &mut TestAppContext,
+    ) {
+        const TYPED: Option<(bool, bool)> = Some((true, false));
+        const EXTERNAL: Option<(bool, bool)> = Some((false, true));
+        let position = point(px(30.), px(30.));
+        let entered = |path: &PathBuf| FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths([path.clone()].into_iter().collect()),
+        };
+        let submit = FileDropEvent::Submit { position };
+
+        // Enter, leave and re-enter across windows, then drop in the destination.
+        let path = PathBuf::from("/tmp/cross-window-drag");
+        let source = start_file_drag(cx, path.clone(), true);
+        promote_file_drag(cx, &source);
+        let destination = add_file_drag_window(cx, PathBuf::from("/tmp/destination"));
+
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, entered(&path)),
+            TYPED
+        );
+        assert!(cx.update(|cx| cx.active_drag_is_platform_owned()));
+        assert_eq!(
+            destination.observed_drag_moves.borrow().last(),
+            Some(&position)
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, FileDropEvent::Exited),
+            None
+        );
+        assert_eq!(dispatch_file_drop(cx, source.window, entered(&path)), TYPED);
+        assert_eq!(
+            dispatch_file_drop(cx, source.window, FileDropEvent::Exited),
+            None
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, entered(&path)),
+            TYPED
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, submit.clone()),
+            None
+        );
+        assert_eq!(
+            destination.observed_drops.borrow().as_slice(),
+            std::slice::from_ref(&path)
+        );
+        assert!(source.observed_drops.borrow().is_empty());
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, FileDropEvent::Exited),
+            None
+        );
+        // AppKit reports the session end to the source window only.
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, FileDropEvent::Ended),
+            None
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, source.window, FileDropEvent::Ended),
+            None
+        );
+        assert!(!cx.update(|cx| cx.end_platform_drag(source.window.window_id())));
+
+        // Once the session has ended, drags from other apps stay external paths.
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, entered(&path)),
+            EXTERNAL
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, FileDropEvent::Exited),
+            None
+        );
+
+        // Cancelling the restored drag in the destination releases the platform drag.
+        let cancelled_path = PathBuf::from("/tmp/cross-window-cancelled");
+        let cancelled = start_file_drag(cx, cancelled_path.clone(), true);
+        promote_file_drag(cx, &cancelled);
+        assert_eq!(
+            dispatch_file_drop(cx, destination.window, entered(&cancelled_path)),
+            TYPED
+        );
+        let stopped = cx
+            .update_window(destination.window, |_, window, cx| {
+                cx.stop_active_drag(window)
+            })
+            .expect("window should exist");
+        assert!(stopped);
+        assert!(!cx.update(|cx| cx.end_platform_drag(cancelled.window.window_id())));
+        assert_eq!(
+            dispatch_file_drop(cx, cancelled.window, entered(&cancelled_path)),
+            EXTERNAL
+        );
+        assert_eq!(
+            dispatch_file_drop(cx, cancelled.window, FileDropEvent::Exited),
+            None
+        );
+
+        // Closing the window holding the restored drag hands it back to the platform session.
+        let reclaimed_path = PathBuf::from("/tmp/cross-window-reclaimed");
+        let reclaimed = start_file_drag(cx, reclaimed_path.clone(), true);
+        promote_file_drag(cx, &reclaimed);
+        let closing = add_file_drag_window(cx, PathBuf::from("/tmp/closing"));
+        assert_eq!(
+            dispatch_file_drop(cx, closing.window, entered(&reclaimed_path)),
+            TYPED
+        );
+        let update_result = cx.update_window(closing.window, |_, window, _| window.remove_window());
+        assert!(
+            update_result.is_ok(),
+            "failed to remove window: {update_result:?}"
+        );
+        assert!(cx.update(|cx| cx.active_drag.is_none()));
+        assert_eq!(
+            dispatch_file_drop(cx, reclaimed.window, entered(&reclaimed_path)),
+            TYPED
+        );
+        assert_eq!(dispatch_file_drop(cx, reclaimed.window, submit), None);
+        assert_eq!(
+            reclaimed.observed_drops.borrow().as_slice(),
+            std::slice::from_ref(&reclaimed_path)
+        );
+        assert!(cx.update(|cx| cx.end_platform_drag(reclaimed.window.window_id())));
+    }
+
     #[gpui::test]
     fn file_drag_is_promoted_at_boundary_and_restored_in_source_window(cx: &mut TestAppContext) {
-        struct Drag {
-            window: AnyWindowHandle,
-            observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
-            observed_drops: Rc<RefCell<Vec<PathBuf>>>,
-        }
-
-        fn start_drag(cx: &mut TestAppContext, path: PathBuf, platform_result: bool) -> Drag {
-            let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
-            let observed_drops = Rc::new(RefCell::new(Vec::new()));
-            let window: AnyWindowHandle = cx
-                .add_window({
-                    let observed_drag_moves = observed_drag_moves.clone();
-                    let observed_drops = observed_drops.clone();
-                    move |_, _| FileDragView {
-                        path,
-                        observed_drag_moves,
-                        observed_drops,
-                    }
-                })
-                .into();
-            cx.test_window(window)
-                .set_start_external_drag_result(platform_result);
-
-            let update_result = cx.update_window(window, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.dispatch_event(
-                    MouseDownEvent {
-                        position: point(px(10.), px(10.)),
-                        button: MouseButton::Left,
-                        modifiers: Default::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(20.), px(20.)),
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                assert!(cx.active_drag.is_some());
-            });
-            assert!(
-                update_result.is_ok(),
-                "failed to start drag: {update_result:?}"
-            );
-
-            assert!(cx.test_window(window).external_drag_files().is_empty());
-            Drag {
-                window,
-                observed_drag_moves,
-                observed_drops,
-            }
-        }
-
         let successful_path = PathBuf::from("/tmp/successful-drag");
-        let successful = start_drag(cx, successful_path.clone(), true);
+        let successful = start_file_drag(cx, successful_path.clone(), true);
         let outside_position = point(px(-1.), px(20.));
         let update_result = cx.update_window(successful.window, |_, window, cx| {
             window.dispatch_event(
@@ -7714,7 +7892,7 @@ mod tests {
             assert!(
                 cx.active_drag
                     .as_ref()
-                    .is_some_and(|drag| drag.value.downcast_ref::<ExternalPaths>().is_some())
+                    .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>().is_some())
             );
             window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
             assert!(cx.active_drag.is_none());
@@ -7799,7 +7977,7 @@ mod tests {
         );
 
         let cancelled_path = PathBuf::from("/tmp/cancelled-drag");
-        let cancelled = start_drag(cx, cancelled_path.clone(), true);
+        let cancelled = start_file_drag(cx, cancelled_path.clone(), true);
         let update_result = cx.update_window(cancelled.window, |_, window, cx| {
             window.dispatch_event(
                 MouseExitEvent {
@@ -7835,7 +8013,7 @@ mod tests {
         assert!(!cx.update(|cx| cx.end_platform_drag(cancelled.window.window_id())));
 
         let removed_path = PathBuf::from("/tmp/removed-window-drag");
-        let removed = start_drag(cx, removed_path, true);
+        let removed = start_file_drag(cx, removed_path, true);
         let removed_window_id = removed.window.window_id();
         let update_result = cx.update_window(removed.window, |_, window, cx| {
             window.dispatch_event(
@@ -7857,7 +8035,7 @@ mod tests {
         assert!(!cx.update(|cx| cx.end_platform_drag(removed_window_id)));
 
         let failed_path = PathBuf::from("/tmp/failed-drag");
-        let failed = start_drag(cx, failed_path.clone(), false);
+        let failed = start_file_drag(cx, failed_path.clone(), false);
         let update_result = cx.update_window(failed.window, |_, window, cx| {
             window.dispatch_event(
                 MouseExitEvent {
