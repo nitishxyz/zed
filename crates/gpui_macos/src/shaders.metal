@@ -20,6 +20,8 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
+float4 sample_catmull_rom(texture2d<float> tex, sampler s, float2 uv,
+                          AtlasTile tile);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -748,9 +750,12 @@ fragment float4 polychrome_sprite_fragment(
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
   float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
-  float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, 2.0);
+      sprite.bicubic
+          ? sample_catmull_rom(atlas_texture, atlas_texture_sampler,
+                               input.tile_position, sprite.tile)
+          : atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float distance = quad_sdf(input.position.xy, sprite.bounds,
+                            sprite.corner_radii, sprite.corner_smoothing);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -1071,6 +1076,39 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
   float2 tile_size = float2(tile.bounds.size.width, tile.bounds.size.height);
   return (tile_origin + unit_vertex * tile_size) /
          float2((float)atlas_size->width, (float)atlas_size->height);
+}
+
+// Catmull-Rom bicubic sample in 9 bilinear taps (the middle two taps of
+// each axis are merged into one). Taps are clamped to the tile's texel
+// centres so neighbouring atlas entries never bleed in.
+float4 sample_catmull_rom(texture2d<float> tex, sampler s, float2 uv,
+                          AtlasTile tile) {
+  float2 tex_size = float2(tex.get_width(), tex.get_height());
+  float2 origin = float2(tile.bounds.origin.x, tile.bounds.origin.y);
+  float2 extent = float2(tile.bounds.size.width, tile.bounds.size.height);
+  float2 lo = (origin + 0.5) / tex_size;
+  float2 hi = (origin + extent - 0.5) / tex_size;
+  float2 pos = uv * tex_size;
+  float2 p1 = floor(pos - 0.5) + 0.5;
+  float2 f = pos - p1;
+  float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  float2 w3 = f * f * (-0.5 + 0.5 * f);
+  float2 w12 = w1 + w2;
+  float2 t0 = clamp((p1 - 1.0) / tex_size, lo, hi);
+  float2 t12 = clamp((p1 + w2 / w12) / tex_size, lo, hi);
+  float2 t3 = clamp((p1 + 2.0) / tex_size, lo, hi);
+  float4 c = tex.sample(s, float2(t0.x, t0.y)) * w0.x * w0.y +
+             tex.sample(s, float2(t12.x, t0.y)) * w12.x * w0.y +
+             tex.sample(s, float2(t3.x, t0.y)) * w3.x * w0.y +
+             tex.sample(s, float2(t0.x, t12.y)) * w0.x * w12.y +
+             tex.sample(s, float2(t12.x, t12.y)) * w12.x * w12.y +
+             tex.sample(s, float2(t3.x, t12.y)) * w3.x * w12.y +
+             tex.sample(s, float2(t0.x, t3.y)) * w0.x * w3.y +
+             tex.sample(s, float2(t12.x, t3.y)) * w12.x * w3.y +
+             tex.sample(s, float2(t3.x, t3.y)) * w3.x * w3.y;
+  return saturate(c);
 }
 
 // Selects corner radius based on quadrant.

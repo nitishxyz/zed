@@ -828,6 +828,10 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+    /// Use bicubic (Catmull-Rom) instead of bilinear sampling when supported.
+    pub bicubic: PaddedBool32,
+    /// Lp exponent for the clip corners; values `<= 2.0` are circular.
+    pub corner_smoothing: f32,
 }
 
 impl From<PolychromeSprite> for Primitive {

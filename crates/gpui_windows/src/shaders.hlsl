@@ -1221,6 +1221,9 @@ struct PolychromeSprite {
     Bounds content_mask;
     Corners corner_radii;
     AtlasTile tile;
+    // Bicubic sampling and squircle clip are Metal-only; ignored here.
+    uint bicubic;
+    float corner_smoothing;
 };
 
 struct PolychromeSpriteVertexOutput {

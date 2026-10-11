@@ -1422,6 +1422,9 @@ struct PolychromeSprite {
     content_mask: Bounds,
     corner_radii: Corners,
     tile: AtlasTile,
+    // Bicubic sampling and squircle clip are Metal-only; ignored here.
+    bicubic: u32,
+    corner_smoothing: f32,
 }
 
 

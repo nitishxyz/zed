@@ -125,9 +125,21 @@ where
     }
 }
 
+/// How an image's texels are filtered when it is scaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageSampling {
+    /// Hardware bilinear filtering (the default).
+    #[default]
+    Linear,
+    /// Catmull-Rom bicubic filtering for sharper upscaling, on renderers that
+    /// support it (Metal); others fall back to bilinear.
+    Bicubic,
+}
+
 /// The style of an image element.
 pub struct ImageStyle {
     grayscale: bool,
+    sampling: ImageSampling,
     object_fit: ObjectFit,
     loading: Option<Box<dyn Fn() -> AnyElement>>,
     fallback: Option<Box<dyn Fn() -> AnyElement>>,
@@ -137,6 +149,7 @@ impl Default for ImageStyle {
     fn default() -> Self {
         Self {
             grayscale: false,
+            sampling: ImageSampling::Linear,
             object_fit: ObjectFit::Contain,
             loading: None,
             fallback: None,
@@ -152,6 +165,12 @@ pub trait StyledImage: Sized {
     /// Set the image to be displayed in grayscale.
     fn grayscale(mut self, grayscale: bool) -> Self {
         self.image_style().grayscale = grayscale;
+        self
+    }
+
+    /// Set how the image is filtered when scaled.
+    fn sampling(mut self, sampling: ImageSampling) -> Self {
+        self.image_style().sampling = sampling;
         self
     }
 
@@ -493,13 +512,15 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with(
                             bounds,
                             new_bounds,
                             corner_radii,
+                            style.corner_smoothing,
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
+                            self.style.sampling,
                         )
                         .log_err();
                 } else if let Some(replacement) = &mut layout_state.replacement {

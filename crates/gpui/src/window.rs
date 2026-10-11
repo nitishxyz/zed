@@ -6,7 +6,8 @@ use crate::{
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    Hsla, ImageSampling, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
@@ -4643,6 +4644,8 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                bicubic: false.into(),
+                corner_smoothing: 0.0,
             });
         }
         Ok(())
@@ -4730,6 +4733,31 @@ impl Window {
         frame_index: usize,
         grayscale: bool,
     ) -> Result<()> {
+        self.paint_image_with(
+            bounds,
+            image_bounds,
+            corner_radii,
+            0.0,
+            data,
+            frame_index,
+            grayscale,
+            ImageSampling::Linear,
+        )
+    }
+
+    /// Like [`Window::paint_image`], with an Lp `corner_smoothing` exponent for the
+    /// clip (`<= 2.0` is circular) and a [`ImageSampling`] mode.
+    pub fn paint_image_with(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        data: Arc<RenderImage>,
+        frame_index: usize,
+        grayscale: bool,
+        sampling: ImageSampling,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let visible_bounds = bounds.intersect(&image_bounds);
@@ -4815,6 +4843,8 @@ impl Window {
             corner_radii,
             tile: sub_tile,
             opacity,
+            bicubic: (sampling == ImageSampling::Bicubic).into(),
+            corner_smoothing,
         });
         Ok(())
     }
