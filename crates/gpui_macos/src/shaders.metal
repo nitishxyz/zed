@@ -1540,7 +1540,15 @@ vertex BackdropCompositeVertexOutput backdrop_composite_vertex(
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
-fragment float4 backdrop_composite_fragment(
+// Replaces (not blends over) the region: `color` is premultiplied and `coverage`
+// drives the destination factor (dual-source `OneMinusSource1Alpha`), so translucent
+// window areas keep the blurred alpha instead of stacking blur over sharp content.
+struct BackdropCompositeFragmentOutput {
+  float4 color [[color(0), index(0)]];
+  float4 coverage [[color(0), index(1)]];
+};
+
+fragment BackdropCompositeFragmentOutput backdrop_composite_fragment(
     BackdropCompositeFragmentInput input [[stage_in]],
     constant BackdropBlur *blur [[buffer(0)]],
     constant BackdropCompositeUniforms *u [[buffer(1)]],
@@ -1559,5 +1567,6 @@ fragment float4 backdrop_composite_fragment(
   float3 rgb = color.a > 0. ? color.rgb / color.a : float3(0.);
   float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
   rgb = saturate(mix(float3(luma), rgb, blur->saturation));
-  return float4(rgb, alpha * color.a);
+  float a = alpha * color.a;
+  return BackdropCompositeFragmentOutput{float4(rgb * a, a), float4(alpha)};
 }

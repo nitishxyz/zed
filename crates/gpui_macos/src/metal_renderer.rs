@@ -350,12 +350,10 @@ impl MetalRenderer {
             "backdrop_blur_pass",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let backdrop_composite_pipeline_state = build_pipeline_state(
+        let backdrop_composite_pipeline_state = build_backdrop_composite_pipeline_state(
             &device,
             &library,
             "backdrop_blur_composite",
-            "backdrop_composite_vertex",
-            "backdrop_composite_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
 
@@ -1683,6 +1681,42 @@ fn build_backdrop_pass_pipeline_state(
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
     color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// The composite replaces the covered region with the blurred backdrop: its output is
+/// premultiplied, and the second (dual-source) output carries shape coverage, so the
+/// destination keeps only `1 - coverage` (anti-aliased edges) of what was there.
+fn build_backdrop_composite_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function("backdrop_composite_vertex", None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function("backdrop_composite_fragment", None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    let keep = metal::MTLBlendFactor::OneMinusSource1Alpha;
+    color_attachment.set_destination_rgb_blend_factor(keep);
+    color_attachment.set_destination_alpha_blend_factor(keep);
 
     device
         .new_render_pipeline_state(&descriptor)
