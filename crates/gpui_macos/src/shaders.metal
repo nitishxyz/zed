@@ -1507,7 +1507,10 @@ fragment float4 backdrop_composite_fragment(
   float2 texel = (input.position.xy - u->region_origin) / u->region_span * u->dst_size;
   texel = clamp(texel, float2(0.5), u->dst_size - 0.5);
   float4 color = blurred.sample(backdrop_sampler, texel / u->texture_size);
-  float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
-  color.rgb = saturate(mix(float3(luma), color.rgb, blur->saturation));
-  return float4(color.rgb, alpha);
+  // The frame is premultiplied: un-premultiply, and keep the backdrop's own alpha so
+  // blurring over a transparent window region stays transparent instead of black.
+  float3 rgb = color.a > 0. ? color.rgb / color.a : float3(0.);
+  float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+  rgb = saturate(mix(float3(luma), rgb, blur->saturation));
+  return float4(rgb, alpha * color.a);
 }

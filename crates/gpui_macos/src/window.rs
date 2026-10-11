@@ -3267,9 +3267,10 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
-        // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
+        // A material that blurs: `Selection` has no `CABackdropLayer` on macOS 26+, so the
+        // desktop showed through sharp. The tint layers are stripped in `updateLayer`, so
+        // only the backdrop blur remains.
+        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::HudWindow);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
         view
     }
