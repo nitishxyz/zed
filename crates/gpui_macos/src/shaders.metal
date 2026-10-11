@@ -3,6 +3,10 @@
 
 using namespace metal;
 
+// How far a smoothed capsule's end cap extends along the pill's long axis,
+// in corner radii. Must match CAPSULE_CAP_STRETCH in shaders.wgsl.
+constant float CAPSULE_CAP_STRETCH = 1.4;
+
 float4 hsla_to_rgba(Hsla hsla);
 float3 srgb_to_linear(float3 color);
 float3 linear_to_srgb(float3 color);
@@ -26,12 +30,16 @@ float dash_alpha(float t, float period, float length, float dash_velocity,
 float quarter_ellipse_sdf(float2 point, float2 radii);
 float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_radii);
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii);
-float quad_sdf_impl(float2 center_to_point, float corner_radius);
+               Corners_ScaledPixels corner_radii, float corner_smoothing);
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
+                    float corner_smoothing, float2 inset_extent);
+float lp_length(float2 v, float p);
+float capsule_cap_sdf(float2 cap, float corner_radius, float corner_smoothing,
+                      float long_inset);
 float gaussian(float x, float sigma);
 float2 erf(float2 x);
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size);
+                   float2 half_size, float corner_smoothing);
 float4 over(float4 below, float4 above);
 float radians(float degrees);
 float4 fill_color(Background background, float2 position, Bounds_ScaledPixels bounds,
@@ -150,10 +158,29 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   // mirrored into bottom right quadrant.
   float2 corner_center_to_point = corner_to_point + corner_radius;
 
+  // Elongated capsule end caps reach (k - 1) * r into the straight run, so
+  // the curved neighborhood starts before corner_center_to_point crosses
+  // zero on the long axis. Mirrors fs_quad in shaders.wgsl.
+  float2 cap_extension = float2(0.0);
+  if (quad.corner_smoothing > 2.0) {
+    float2 inset_extent = half_size - corner_radius;
+    bool x_degenerate = inset_extent.x <= 0.5;
+    bool y_degenerate = inset_extent.y <= 0.5;
+    if (y_degenerate && !x_degenerate) {
+      float k = min(CAPSULE_CAP_STRETCH,
+                    1.0 + inset_extent.x / max(corner_radius, 0.5));
+      cap_extension.x = (k - 1.0) * corner_radius;
+    } else if (x_degenerate && !y_degenerate) {
+      float k = min(CAPSULE_CAP_STRETCH,
+                    1.0 + inset_extent.y / max(corner_radius, 0.5));
+      cap_extension.y = (k - 1.0) * corner_radius;
+    }
+  }
+
   // Whether the nearest point on the border is rounded
   bool is_near_rounded_corner =
-    corner_center_to_point.x >= 0.0 &&
-    corner_center_to_point.y >= 0.0;
+    corner_center_to_point.x >= -cap_extension.x &&
+    corner_center_to_point.y >= -cap_extension.y;
 
   // Vector from straight border inner corner to point.
   //
@@ -179,7 +206,9 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   }
 
   // Signed distance of the point to the outside edge of the quad's border
-  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius);
+  float outer_sdf = quad_sdf_impl(corner_center_to_point, corner_radius,
+                                  quad.corner_smoothing,
+                                  half_size - corner_radius);
 
   // Approximate signed distance of the point to the inside edge of the quad's
   // border. It is negative outside this edge (within the border), and
@@ -190,7 +219,8 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   //   nearest-point-on-ellipse.
   // * When it is quickly known to be outside the edge, -1.0 is used.
   float inner_sdf = 0.0;
-  if (corner_center_to_point.x <= 0.0 || corner_center_to_point.y <= 0.0) {
+  if (corner_center_to_point.x <= -cap_extension.x ||
+      corner_center_to_point.y <= -cap_extension.y) {
     // Fast paths for straight borders
     inner_sdf = -max(straight_border_inner_corner_to_point.x,
                      straight_border_inner_corner_to_point.y);
@@ -521,7 +551,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
 
   float alpha;
   if (shadow.blur_radius == 0.) {
-    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+    float distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii,
+                              shadow.corner_smoothing);
     alpha = saturate(0.5 - distance);
   } else {
     // The signal is only non-zero in a limited range, so don't waste samples
@@ -536,7 +567,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     alpha = 0.;
     for (int i = 0; i < 4; i++) {
       alpha += blur_along_x(point.x, point.y - y, shadow.blur_radius,
-                            corner_radius, half_size) *
+                            corner_radius, half_size, shadow.corner_smoothing) *
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
@@ -547,7 +578,8 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
     alpha = 1. - alpha;
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                      shadow.element_corner_radii);
+                                      shadow.element_corner_radii,
+                                      shadow.corner_smoothing);
     alpha *= saturate(0.5 - element_distance);
   }
 
@@ -718,7 +750,7 @@ fragment float4 polychrome_sprite_fragment(
   float4 sample =
       atlas_texture.sample(atlas_texture_sampler, input.tile_position);
   float distance =
-      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+      quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii, 2.0);
 
   float4 color = sample;
   if (sprite.grayscale) {
@@ -1061,27 +1093,76 @@ float pick_corner_radius(float2 center_to_point, Corners_ScaledPixels corner_rad
 // Signed distance of the point to the quad's border - positive outside the
 // border, and negative inside.
 float quad_sdf(float2 point, Bounds_ScaledPixels bounds,
-               Corners_ScaledPixels corner_radii) {
+               Corners_ScaledPixels corner_radii, float corner_smoothing) {
     float2 half_size = float2(bounds.size.width, bounds.size.height) / 2.0;
     float2 center = float2(bounds.origin.x, bounds.origin.y) + half_size;
     float2 center_to_point = point - center;
     float corner_radius = pick_corner_radius(center_to_point, corner_radii);
     float2 corner_to_point = fabs(center_to_point) - half_size;
     float2 corner_center_to_point = corner_to_point + corner_radius;
-    return quad_sdf_impl(corner_center_to_point, corner_radius);
+    return quad_sdf_impl(corner_center_to_point, corner_radius, corner_smoothing,
+                         half_size - corner_radius);
+}
+
+// Length under the Lp norm; p = 2 is the euclidean (circular) case and
+// higher exponents produce continuous "squircle" corners.
+float lp_length(float2 v, float p) {
+    if (p <= 2.0) {
+        return length(v);
+    }
+    return pow(pow(v.x, p) + pow(v.y, p), 1.0 / p);
+}
+
+// Signed distance of a smoothed capsule's end cap. Exact port of
+// capsule_cap_sdf in crates/gpui_wgpu/src/shaders.wgsl; see the comments
+// there for the derivation.
+float capsule_cap_sdf(float2 cap, float corner_radius, float corner_smoothing,
+                      float long_inset) {
+    float k = min(CAPSULE_CAP_STRETCH, 1.0 + long_inset / max(corner_radius, 0.5));
+    float u = (cap.x + (k - 1.0) * corner_radius) / k;
+    if (u <= 0.0) {
+        // Straight-edge slab along the long run.
+        return max(cap.x, cap.y) - corner_radius;
+    }
+    float v = max(cap.y, 0.0);
+    float q = 2.0 * k;
+    float un = u / corner_radius;
+    float vn = v / corner_radius;
+    float f = pow(un, q) + vn * vn;
+    float2 grad = float2(q * pow(un, q - 1.0) / k, 2.0 * vn) / corner_radius;
+    return (f - 1.0) / max(length(grad), 1e-4);
 }
 
 // Implementation of quad signed distance field
-float quad_sdf_impl(float2 corner_center_to_point, float corner_radius) {
+float quad_sdf_impl(float2 corner_center_to_point, float corner_radius,
+                    float corner_smoothing, float2 inset_extent) {
     if (corner_radius == 0.0) {
         // Fast path for unrounded corners
         return max(corner_center_to_point.x, corner_center_to_point.y);
     } else {
+        if (corner_smoothing > 2.0) {
+            bool x_degenerate = inset_extent.x <= 0.5;
+            bool y_degenerate = inset_extent.y <= 0.5;
+            if (x_degenerate != y_degenerate) {
+                // Capsule: draw the elongated end cap instead of a corner.
+                if (y_degenerate) {
+                    return capsule_cap_sdf(corner_center_to_point, corner_radius,
+                                           corner_smoothing, inset_extent.x);
+                }
+                return capsule_cap_sdf(corner_center_to_point.yx, corner_radius,
+                                       corner_smoothing, inset_extent.y);
+            }
+        }
+        float exponent = corner_smoothing;
+        if (corner_smoothing > 2.0 && inset_extent.x <= 0.5) {
+            // Degenerate on both axes: a circle stays exactly circular.
+            exponent = 2.0;
+        }
         // Signed distance of the point from a quad that is inset by corner_radius
         // It is negative inside this quad, and positive outside
         float signed_distance_to_inset_quad =
             // 0 inside the inset quad, and positive outside
-            length(max(float2(0.0), corner_center_to_point)) +
+            lp_length(max(float2(0.0), corner_center_to_point), exponent) +
             // 0 outside the inset quad, and negative inside
             min(0.0, max(corner_center_to_point.x, corner_center_to_point.y));
 
@@ -1104,10 +1185,35 @@ float2 erf(float2 x) {
 }
 
 float blur_along_x(float x, float y, float sigma, float corner,
-                   float2 half_size) {
-  float delta = min(half_size.y - corner - abs(y), 0.);
-  float curved =
-      half_size.x - corner + sqrt(max(0., corner * corner - delta * delta));
+                   float2 half_size, float corner_smoothing) {
+  float raw = half_size.y - corner - abs(y);
+  float delta = min(raw, 0.);
+  float chord = 0.;
+  if (corner_smoothing <= 2.0) {
+    // Circular corner: circular chord.
+    chord = sqrt(max(0., corner * corner - delta * delta));
+  } else if (half_size.y - corner <= 0.5) {
+    // Smoothed horizontal capsule: chord of the elongated end cap.
+    float k = min(CAPSULE_CAP_STRETCH,
+                  1.0 + max(half_size.x - corner, 0.0) / max(corner, 0.5));
+    float q = 2.0 * k;
+    float vn = clamp(abs(delta) / max(corner, 0.5), 0.0, 1.0);
+    chord = k * corner * pow(max(0.0, 1.0 - vn * vn), 1.0 / q) - (k - 1.0) * corner;
+  } else if (half_size.x - corner <= 0.5) {
+    // Smoothed vertical capsule.
+    float k = min(CAPSULE_CAP_STRETCH,
+                  1.0 + max(half_size.y - corner, 0.0) / max(corner, 0.5));
+    float q = 2.0 * k;
+    float u = max(((k - 1.0) * corner - raw) / k, 0.0);
+    float un = min(u / max(corner, 0.5), 1.0);
+    chord = corner * sqrt(max(0.0, 1.0 - pow(un, q)));
+  } else {
+    // Superellipse corner: |dx|^p + |dy|^p = r^p.
+    chord = pow(max(0.0, pow(corner, corner_smoothing) -
+                         pow(abs(delta), corner_smoothing)),
+                1.0 / corner_smoothing);
+  }
+  float curved = half_size.x - corner + chord;
   float2 integral =
       0.5 + 0.5 * erf((x + float2(-curved, curved)) * (sqrt(0.5) / sigma));
   return integral.y - integral.x;
@@ -1276,4 +1382,132 @@ float4 fill_color(Background background,
   }
 
   return color;
+}
+
+// ---------------------------------------------------------------------------
+// Backdrop blur
+//
+// A backdrop blur is rendered in three passes (see MetalRenderer::
+// draw_backdrop_blur): a downsampling horizontal Gaussian from the frame
+// texture into a scratch texture, a vertical Gaussian into a second scratch
+// texture, and a composite pass that draws the result back into the frame,
+// clipped by the element's rounded-rect SDF. Must match
+// BackdropPassUniforms / BackdropCompositeUniforms in metal_renderer.rs.
+
+struct BackdropPassUniforms {
+  float2 src_origin;   // sampled-texture px mapped to uv (0, 0)
+  float2 src_span;     // sampled-texture px spanned by uv 0..1
+  float2 clamp_min;    // sampled px clamp (region bounds)
+  float2 clamp_max;
+  float2 texture_size; // full size of the sampled texture, in px
+  float2 direction;    // blur axis
+  float sigma;         // Gaussian sigma in sampled px
+  float step;          // distance between taps in sampled px
+  float prefilter;     // perpendicular prefilter offset in sampled px
+  int tap_count;       // taps on each side of the centre
+};
+
+struct BackdropCompositeUniforms {
+  float2 region_origin; // device px mapped to scratch texel 0
+  float2 region_span;   // device px covered by `dst_size` texels
+  float2 dst_size;      // scratch texels holding the blurred region
+  float2 texture_size;  // full scratch texture size
+};
+
+struct BackdropPassVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+};
+
+vertex BackdropPassVertexOutput backdrop_pass_vertex(uint vertex_id [[vertex_id]]) {
+  // Two triangles covering the viewport.
+  float2 corners[6] = {float2(0., 0.), float2(1., 0.), float2(0., 1.),
+                       float2(1., 0.), float2(0., 1.), float2(1., 1.)};
+  float2 uv = corners[vertex_id];
+  BackdropPassVertexOutput out;
+  out.position = float4(uv.x * 2. - 1., 1. - uv.y * 2., 0., 1.);
+  out.uv = uv;
+  return out;
+}
+
+constexpr sampler backdrop_sampler(filter::linear, address::clamp_to_edge);
+
+float4 backdrop_sample(texture2d<float> source, constant BackdropPassUniforms *u,
+                       float2 px) {
+  px = clamp(px, u->clamp_min, u->clamp_max);
+  return source.sample(backdrop_sampler, px / u->texture_size);
+}
+
+fragment float4 backdrop_pass_fragment(
+    BackdropPassVertexOutput input [[stage_in]],
+    constant BackdropPassUniforms *u [[buffer(0)]],
+    texture2d<float> source [[texture(0)]]) {
+  float2 center = u->src_origin + input.uv * u->src_span;
+  float4 sum = float4(0.);
+  float total = 0.;
+  if (u->prefilter > 1.) {
+    // Box downsample by `prefilter` source px per output texel. Each bilinear
+    // tap sits on a texel corner and averages a 2x2 footprint, so
+    // ceil(prefilter / 2)^2 taps cover the box without aliasing.
+    int n = int(ceil(u->prefilter * 0.5));
+    float first = -float(n - 1);
+    for (int y = 0; y < n; y++) {
+      for (int x = 0; x < n; x++) {
+        float2 offset = float2(first + 2. * float(x), first + 2. * float(y));
+        sum += backdrop_sample(source, u, center + offset);
+        total += 1.;
+      }
+    }
+    return sum / total;
+  }
+  float inv_two_sigma2 = 1. / (2. * u->sigma * u->sigma);
+  for (int i = -u->tap_count; i <= u->tap_count; i++) {
+    float offset = float(i) * u->step;
+    float weight = exp(-(offset * offset) * inv_two_sigma2);
+    sum += backdrop_sample(source, u, center + u->direction * offset) * weight;
+    total += weight;
+  }
+  return sum / total;
+}
+
+struct BackdropCompositeVertexOutput {
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropCompositeFragmentInput {
+  float4 position [[position]];
+};
+
+vertex BackdropCompositeVertexOutput backdrop_composite_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(0)]],
+    constant BackdropBlur *blur [[buffer(1)]],
+    constant Size_DevicePixels *viewport_size [[buffer(2)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float4 device_position = to_device_position(unit_vertex, blur->bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur->bounds,
+                                                 blur->content_mask.bounds);
+  return BackdropCompositeVertexOutput{
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_composite_fragment(
+    BackdropCompositeFragmentInput input [[stage_in]],
+    constant BackdropBlur *blur [[buffer(0)]],
+    constant BackdropCompositeUniforms *u [[buffer(1)]],
+    texture2d<float> blurred [[texture(0)]]) {
+  float distance = quad_sdf(input.position.xy, blur->bounds, blur->corner_radii,
+                            blur->corner_smoothing);
+  float alpha = saturate(0.5 - distance);
+  if (alpha <= 0.) {
+    discard_fragment();
+  }
+  float2 texel = (input.position.xy - u->region_origin) / u->region_span * u->dst_size;
+  texel = clamp(texel, float2(0.5), u->dst_size - 0.5);
+  float4 color = blurred.sample(backdrop_sampler, texel / u->texture_size);
+  float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+  color.rgb = saturate(mix(float3(luma), color.rgb, blur->saturation));
+  return float4(color.rgb, alpha);
 }

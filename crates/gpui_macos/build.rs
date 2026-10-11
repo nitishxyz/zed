@@ -62,6 +62,7 @@ mod macos_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            "BackdropBlur".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

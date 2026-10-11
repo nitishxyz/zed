@@ -1578,6 +1578,9 @@ impl WgpuRenderer {
                         #[cfg(not(target_os = "linux"))]
                         let _ = range;
                     }
+                    // Backdrop blur is not implemented on wgpu yet; the element
+                    // paints normally without frosting what lies beneath it.
+                    PrimitiveBatch::BackdropBlurs(_) => {}
                 }
             }
         }

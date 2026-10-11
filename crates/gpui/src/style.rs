@@ -305,6 +305,18 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// Gaussian blur radius applied to whatever is painted beneath this element
+    /// ("frosted glass"). Supported on macOS (Metal); ignored elsewhere.
+    pub backdrop_blur: Option<Pixels>,
+
+    /// Saturation multiplier applied to the blurred backdrop; 1.0 leaves it
+    /// unchanged. Only used together with `backdrop_blur`.
+    pub backdrop_saturation: Option<f32>,
+
+    /// Uniform scale applied to everything this element and its descendants
+    /// paint, about the element's centre. Layout and hit-testing are unaffected.
+    pub scale: Option<f32>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -719,6 +731,16 @@ impl Style {
             &self.box_shadow,
         );
 
+        if self.backdrop_blur.is_some() || self.backdrop_saturation.is_some() {
+            window.paint_backdrop_blur(
+                bounds,
+                corner_radii,
+                self.corner_smoothing,
+                self.backdrop_blur.unwrap_or_default(),
+                self.backdrop_saturation.unwrap_or(1.0),
+            );
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -830,6 +852,9 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            backdrop_blur: None,
+            backdrop_saturation: None,
+            scale: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,

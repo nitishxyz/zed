@@ -41,6 +41,30 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Blurs whatever has already been painted beneath this element, clipped to
+    /// its rounded (optionally squircle) bounds, before its own background and
+    /// children paint. Pair with a translucent background for frosted glass.
+    /// Rendered on macOS (Metal); other renderers ignore it.
+    fn backdrop_blur(mut self, radius: impl Into<crate::Pixels>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
+    /// Sets the saturation multiplier applied to the blurred backdrop (1.0 =
+    /// unchanged; Apple materials use roughly 1.5-1.8).
+    fn backdrop_saturation(mut self, saturation: f32) -> Self {
+        self.style().backdrop_saturation = Some(saturation);
+        self
+    }
+
+    /// Uniformly scales everything this element (and its subtree) paints about
+    /// the element's centre, e.g. `.scale(1.08)` for a tvOS-style focus zoom.
+    /// Layout and hit-testing use the unscaled bounds.
+    fn scale(mut self, scale: f32) -> Self {
+        self.style().scale = Some(scale);
+        self
+    }
+
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)
     fn block(mut self) -> Self {

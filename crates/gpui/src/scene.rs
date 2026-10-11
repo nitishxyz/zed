@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.backdrop_blurs.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -94,11 +96,17 @@ impl Scene {
             return;
         }
 
+        // A backdrop blur samples beyond its own bounds, so it must be ordered
+        // after everything painted within its sampling footprint.
+        let tree_bounds = match &primitive {
+            Primitive::BackdropBlur(blur) => clipped_bounds.dilate(blur.sample_padding()),
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(tree_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -133,6 +141,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::BackdropBlur(blur) => {
+                blur.order = order;
+                self.backdrop_blurs.push(*blur);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +172,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.backdrop_blurs.sort_by_key(|blur| blur.order);
     }
 
     #[cfg_attr(
@@ -187,6 +200,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            backdrop_blurs_start: 0,
+            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
         }
     }
 }
@@ -200,6 +215,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
+    BackdropBlur,
     Shadow,
     #[default]
     Quad,
@@ -228,6 +244,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    BackdropBlur(BackdropBlur),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +259,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
         }
     }
 
@@ -255,6 +273,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::BackdropBlur(blur) => &blur.content_mask,
         }
     }
 }
@@ -283,6 +302,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    backdrop_blurs_start: usize,
+    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +336,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.backdrop_blurs_iter.peek().map(|b| b.order),
+                PrimitiveKind::BackdropBlur,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +486,14 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::BackdropBlur => {
+                // Each backdrop blur is its own batch: it must observe every
+                // primitive drawn before it, including earlier blurs.
+                let start = self.backdrop_blurs_start;
+                self.backdrop_blurs_iter.next();
+                self.backdrop_blurs_start = start + 1;
+                Some(PrimitiveBatch::BackdropBlurs(start..start + 1))
+            }
         }
     }
 }
@@ -493,6 +526,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    BackdropBlurs(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +559,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
         }
     }
 }
@@ -592,6 +627,40 @@ pub struct Shadow {
 impl From<Shadow> for Primitive {
     fn from(shadow: Shadow) -> Self {
         Primitive::Shadow(shadow)
+    }
+}
+
+/// Blurs (and optionally saturates) everything painted beneath `bounds`
+/// before it, clipped to a rounded rect. Renderers without support skip it.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct BackdropBlur {
+    /// Draw order assigned by the scene.
+    pub order: DrawOrder,
+    /// Gaussian standard deviation of the blur, in device pixels.
+    pub blur_radius: ScaledPixels,
+    /// Region that receives the blurred backdrop.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Clip applied to the blurred region.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corner radii of the blurred region.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Superellipse exponent for the corners; values <= 2 render circular corners.
+    pub corner_smoothing: f32,
+    /// Saturation multiplier applied to the blurred backdrop (1.0 = unchanged).
+    pub saturation: f32,
+}
+
+impl BackdropBlur {
+    /// How far outside its bounds the blur reads from.
+    pub fn sample_padding(&self) -> ScaledPixels {
+        ScaledPixels((self.blur_radius.0 * 3.0).ceil())
+    }
+}
+
+impl From<BackdropBlur> for Primitive {
+    fn from(blur: BackdropBlur) -> Self {
+        Primitive::BackdropBlur(blur)
     }
 }
 
@@ -951,5 +1020,233 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+/// A uniform scale followed by a translation, in device pixels:
+/// `p' = p * scale + offset`. Used to implement element scale transforms by
+/// rewriting primitives on the CPU as they're inserted into the scene.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScaleTransform {
+    pub scale: f32,
+    pub offset: Point<ScaledPixels>,
+}
+
+impl Default for ScaleTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl ScaleTransform {
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        offset: Point {
+            x: ScaledPixels(0.0),
+            y: ScaledPixels(0.0),
+        },
+    };
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// Composes a scale of `scale` about `origin` (in this transform's input
+    /// space) inside this transform.
+    pub fn then_scale_about(self, origin: Point<ScaledPixels>, scale: f32) -> Self {
+        Self {
+            scale: self.scale * scale,
+            offset: point(
+                self.offset.x + ScaledPixels(origin.x.0 * (1.0 - scale) * self.scale),
+                self.offset.y + ScaledPixels(origin.y.0 * (1.0 - scale) * self.scale),
+            ),
+        }
+    }
+
+    pub fn apply_point(&self, p: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        point(
+            ScaledPixels(p.x.0 * self.scale) + self.offset.x,
+            ScaledPixels(p.y.0 * self.scale) + self.offset.y,
+        )
+    }
+
+    pub fn apply_length(&self, length: ScaledPixels) -> ScaledPixels {
+        ScaledPixels(length.0 * self.scale)
+    }
+
+    pub fn apply_bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.apply_point(bounds.origin),
+            size: Size {
+                width: self.apply_length(bounds.size.width),
+                height: self.apply_length(bounds.size.height),
+            },
+        }
+    }
+
+    pub fn apply_content_mask(&self, mask: ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: self.apply_bounds(mask.bounds),
+        }
+    }
+
+    fn apply_corners(&self, corners: Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        Corners {
+            top_left: self.apply_length(corners.top_left),
+            top_right: self.apply_length(corners.top_right),
+            bottom_right: self.apply_length(corners.bottom_right),
+            bottom_left: self.apply_length(corners.bottom_left),
+        }
+    }
+
+    fn apply_edges(&self, edges: Edges<ScaledPixels>) -> Edges<ScaledPixels> {
+        Edges {
+            top: self.apply_length(edges.top),
+            right: self.apply_length(edges.right),
+            bottom: self.apply_length(edges.bottom),
+            left: self.apply_length(edges.left),
+        }
+    }
+
+    /// Conjugates a sprite transformation so it applies in the transformed
+    /// space: `M' = T * M * T^-1`, which for a uniform scale keeps the
+    /// rotation/scale block and rewrites the translation.
+    fn apply_matrix(&self, matrix: TransformationMatrix) -> TransformationMatrix {
+        if matrix == TransformationMatrix::unit() {
+            return matrix;
+        }
+        let r = matrix.rotation_scale;
+        let (tx, ty) = (self.offset.x.0, self.offset.y.0);
+        TransformationMatrix {
+            rotation_scale: r,
+            translation: [
+                self.scale * matrix.translation[0] + tx - (r[0][0] * tx + r[0][1] * ty),
+                self.scale * matrix.translation[1] + ty - (r[1][0] * tx + r[1][1] * ty),
+            ],
+        }
+    }
+
+    pub fn apply_to_primitive(&self, primitive: &mut Primitive) {
+        match primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = self.apply_bounds(shadow.bounds);
+                shadow.content_mask = self.apply_content_mask(shadow.content_mask);
+                shadow.corner_radii = self.apply_corners(shadow.corner_radii);
+                shadow.blur_radius = self.apply_length(shadow.blur_radius);
+                shadow.element_bounds = self.apply_bounds(shadow.element_bounds);
+                shadow.element_corner_radii = self.apply_corners(shadow.element_corner_radii);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = self.apply_bounds(quad.bounds);
+                quad.content_mask = self.apply_content_mask(quad.content_mask);
+                quad.corner_radii = self.apply_corners(quad.corner_radii);
+                quad.border_widths = self.apply_edges(quad.border_widths);
+            }
+            Primitive::Path(path) => {
+                path.bounds = self.apply_bounds(path.bounds);
+                path.content_mask = self.apply_content_mask(path.content_mask);
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = self.apply_point(vertex.xy_position);
+                    vertex.content_mask = self.apply_content_mask(vertex.content_mask);
+                }
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = self.apply_bounds(underline.bounds);
+                underline.content_mask = self.apply_content_mask(underline.content_mask);
+                underline.thickness = self.apply_length(underline.thickness);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = self.apply_bounds(sprite.bounds);
+                sprite.content_mask = self.apply_content_mask(sprite.content_mask);
+                sprite.transformation = self.apply_matrix(sprite.transformation);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = self.apply_bounds(sprite.bounds);
+                sprite.content_mask = self.apply_content_mask(sprite.content_mask);
+                sprite.transformation = self.apply_matrix(sprite.transformation);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = self.apply_bounds(sprite.bounds);
+                sprite.content_mask = self.apply_content_mask(sprite.content_mask);
+                sprite.corner_radii = self.apply_corners(sprite.corner_radii);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = self.apply_bounds(surface.bounds);
+                surface.content_mask = self.apply_content_mask(surface.content_mask);
+            }
+            Primitive::BackdropBlur(blur) => {
+                blur.bounds = self.apply_bounds(blur.bounds);
+                blur.content_mask = self.apply_content_mask(blur.content_mask);
+                blur.corner_radii = self.apply_corners(blur.corner_radii);
+                blur.blur_radius = self.apply_length(blur.blur_radius);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sp(x: f32, y: f32) -> Point<ScaledPixels> {
+        point(ScaledPixels(x), ScaledPixels(y))
+    }
+
+    #[test]
+    fn scale_transform_keeps_origin_fixed_and_composes() {
+        let t = ScaleTransform::IDENTITY.then_scale_about(sp(100.0, 50.0), 2.0);
+        assert_eq!(t.apply_point(sp(100.0, 50.0)), sp(100.0, 50.0));
+        assert_eq!(t.apply_point(sp(110.0, 50.0)), sp(120.0, 50.0));
+
+        // Nested: scale 2 about (100, 50), then 1.5 about (110, 50) in the
+        // outer transform's input space.
+        let nested = t.then_scale_about(sp(110.0, 50.0), 1.5);
+        let expected = t.apply_point(sp(110.0 + (120.0 - 110.0) * 1.5, 50.0));
+        assert_eq!(nested.apply_point(sp(120.0, 50.0)), expected);
+        assert_eq!(nested.scale, 3.0);
+    }
+
+    #[test]
+    fn backdrop_blur_orders_after_content_in_sample_footprint() {
+        let mut scene = Scene::default();
+        let quad_bounds = Bounds {
+            origin: sp(0.0, 0.0),
+            size: Size {
+                width: ScaledPixels(10.0),
+                height: ScaledPixels(10.0),
+            },
+        };
+        let mask = ContentMask {
+            bounds: Bounds {
+                origin: sp(0.0, 0.0),
+                size: Size {
+                    width: ScaledPixels(1000.0),
+                    height: ScaledPixels(1000.0),
+                },
+            },
+        };
+        scene.insert_primitive(Quad {
+            bounds: quad_bounds,
+            content_mask: mask,
+            ..Default::default()
+        });
+        // Doesn't overlap the quad, but its blur footprint does.
+        scene.insert_primitive(BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(10.0),
+            bounds: Bounds {
+                origin: sp(20.0, 0.0),
+                size: quad_bounds.size,
+            },
+            content_mask: mask,
+            corner_radii: Corners::default(),
+            corner_smoothing: 0.0,
+            saturation: 1.0,
+        });
+        scene.finish();
+        assert!(scene.backdrop_blurs[0].order > scene.quads[0].order);
+        let batches: Vec<_> = scene.batches().collect();
+        assert!(matches!(batches[0], PrimitiveBatch::Quads(_)));
+        assert!(matches!(batches[1], PrimitiveBatch::BackdropBlurs(_)));
     }
 }

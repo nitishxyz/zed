@@ -372,6 +372,8 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Backdrop blur is not implemented on DirectX yet; skip it.
+                PrimitiveBatch::BackdropBlurs(_) => Ok(()),
             }
             .with_context(|| {
                 format!(
