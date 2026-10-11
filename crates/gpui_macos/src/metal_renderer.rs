@@ -15,8 +15,9 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::{CVMetalTexture, CVMetalTextureGetTexture},
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -126,6 +127,10 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    /// Opaque 32BGRA surfaces (e.g. IOSurface-backed video frames).
+    surfaces_bgra_pipeline_state: metal::RenderPipelineState,
+    /// BGRA surface textures encoded this frame, retained until the GPU completes.
+    surface_textures: Vec<CVMetalTexture>,
     backdrop_pass_pipeline_state: metal::RenderPipelineState,
     backdrop_composite_pipeline_state: metal::RenderPipelineState,
     /// Two half-resolution scratch textures used by backdrop blur passes.
@@ -330,6 +335,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let surfaces_bgra_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "surfaces_bgra",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let backdrop_pass_pipeline_state = build_backdrop_pass_pipeline_state(
             &device,
@@ -367,6 +380,8 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            surfaces_bgra_pipeline_state,
+            surface_textures: Vec::new(),
             backdrop_pass_pipeline_state,
             backdrop_composite_pipeline_state,
             backdrop_scratch: None,
@@ -554,10 +569,12 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        let surface_textures = Cell::new(mem::take(&mut self.surface_textures));
         let block = ConcreteBlock::new(move |_| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            drop(surface_textures.take());
         });
         let block = block.copy();
         command_buffer.add_completed_handler(&block);
@@ -1430,6 +1447,39 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_width() as i32),
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
+
+            if surface.image_buffer.get_pixel_format() == kCVPixelFormatType_32BGRA {
+                let Ok(texture) = self.core_video_texture_cache.create_texture_from_image(
+                    surface.image_buffer.as_concrete_TypeRef(),
+                    None,
+                    MTLPixelFormat::BGRA8Unorm,
+                    surface.image_buffer.get_width(),
+                    surface.image_buffer.get_height(),
+                    0,
+                ) else {
+                    continue;
+                };
+                command_encoder.set_render_pipeline_state(&self.surfaces_bgra_pipeline_state);
+                command_encoder.set_vertex_bytes(
+                    SurfaceInputIndex::TextureSize as u64,
+                    mem::size_of_val(&texture_size) as u64,
+                    &texture_size as *const Size<DevicePixels> as *const _,
+                );
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.draw_primitives_instanced_base_instance(
+                    metal::MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                    (first_surface + index) as u64,
+                );
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                self.surface_textures.push(texture);
+                continue;
+            }
 
             assert_eq!(
                 surface.image_buffer.get_pixel_format(),
