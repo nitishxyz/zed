@@ -2148,11 +2148,21 @@ impl ContentMask<Pixels> {
         }
     }
 
-    /// Intersect the content mask with the given content mask. The result clips to the
-    /// rounded corners of the innermost rounded mask (`other` if it is rounded).
+    /// Intersect the content mask with the given content mask.
+    ///
+    /// A mask carries one rounding. When both masks are rounded, the result keeps the
+    /// one whose rounded rectangle is smaller: when one contains the other, the inner
+    /// one's corners are the ones that clip (e.g. a rounded card inside a rounded
+    /// pane), while an inner mask larger than the outer (e.g. full-size content
+    /// revealed through a smaller rounded window) must not discard the outer corners.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        let rounded = if other.is_rounded() { other } else { self };
+        let area = |mask: &Self| mask.rounded_bounds.size.width * mask.rounded_bounds.size.height.0;
+        let rounded = match (self.is_rounded(), other.is_rounded()) {
+            (true, true) if area(self) < area(other) => self,
+            (_, true) => other,
+            _ => self,
+        };
         ContentMask {
             bounds,
             rounded_bounds: rounded.rounded_bounds,
