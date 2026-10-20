@@ -2083,13 +2083,57 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+/// rendered.
+///
+/// The mask is the rectangle `bounds`, optionally further clipped to the rounded rectangle
+/// `rounded_bounds` with `corner_radii` and `corner_smoothing` (the same continuous corners as
+/// quads). Rounded clipping is only implemented by the Metal renderer (macOS); other platforms
+/// clip to `bounds` and ignore the radii.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     /// The bounds
     pub bounds: Bounds<P>,
+    /// The rounded rectangle `corner_radii` apply to. Ignored when all radii are zero.
+    pub rounded_bounds: Bounds<P>,
+    /// Corner radii of the rounded clip; zero for a plain rectangular mask.
+    pub corner_radii: Corners<P>,
+    /// Continuous corner smoothing of the rounded clip, as for quads.
+    pub corner_smoothing: f32,
+    /// Keeps the GPU layout 8-byte aligned.
+    pub pad: f32,
+}
+
+impl<P: Clone + Debug + Default + PartialEq + Eq> Eq for ContentMask<P> {}
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// A rectangular content mask.
+    pub fn new(bounds: Bounds<P>) -> Self {
+        ContentMask {
+            bounds,
+            ..Default::default()
+        }
+    }
+
+    /// A content mask clipped to the given rounded rectangle.
+    pub fn rounded(bounds: Bounds<P>, corner_radii: Corners<P>, corner_smoothing: f32) -> Self {
+        ContentMask {
+            rounded_bounds: bounds.clone(),
+            bounds,
+            corner_radii,
+            corner_smoothing,
+            pad: 0.,
+        }
+    }
+
+    /// Whether the mask clips to rounded corners.
+    pub fn is_rounded(&self) -> bool {
+        let zero = P::default();
+        self.corner_radii.top_left != zero
+            || self.corner_radii.top_right != zero
+            || self.corner_radii.bottom_right != zero
+            || self.corner_radii.bottom_left != zero
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -2097,13 +2141,25 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            rounded_bounds: self.rounded_bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+            corner_smoothing: self.corner_smoothing,
+            pad: 0.,
         }
     }
 
-    /// Intersect the content mask with the given content mask.
+    /// Intersect the content mask with the given content mask. The result clips to the
+    /// rounded corners of the innermost rounded mask (`other` if it is rounded).
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        let rounded = if other.is_rounded() { other } else { self };
+        ContentMask {
+            bounds,
+            rounded_bounds: rounded.rounded_bounds,
+            corner_radii: rounded.corner_radii,
+            corner_smoothing: rounded.corner_smoothing,
+            pad: 0.,
+        }
     }
 }
 
@@ -2956,6 +3012,7 @@ impl Window {
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.cover_bounds(self.content_mask().bounds),
+            ..Default::default()
         }
     }
 
@@ -3711,7 +3768,7 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            let mask = self.content_mask().intersect(&mask);
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -3950,6 +4007,7 @@ impl Window {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                ..Default::default()
             })
     }
 
@@ -4387,6 +4445,7 @@ impl Window {
                 self.insert_primitive(Quad {
                     content_mask: ContentMask {
                         bounds: content_mask_bounds,
+                        ..quad.content_mask
                     },
                     ..quad
                 });

@@ -1612,7 +1612,7 @@ impl Element for TerminalElement {
         cx: &mut App,
     ) {
         let paint_start = Instant::now();
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        window.with_content_mask(Some(ContentMask::new(bounds)), |window| {
             let scroll_top = self.terminal_view.read(cx).scroll_top;
 
             window.paint_quad(fill(bounds, layout.background_color));

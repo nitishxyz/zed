@@ -41,6 +41,18 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Hides overflow and clips descendants (quads, text, images, paths and
+    /// surfaces) to this element's rounded, optionally continuous, corners.
+    /// Rounded clipping is implemented on macOS; elsewhere this clips to the
+    /// rectangle like `overflow_hidden`.
+    fn rounded_clip(mut self) -> Self {
+        let style = self.style();
+        style.overflow.x = Some(crate::Overflow::Hidden);
+        style.overflow.y = Some(crate::Overflow::Hidden);
+        style.rounded_clip = Some(true);
+        self
+    }
+
     /// Blurs whatever has already been painted beneath this element, clipped to
     /// its rounded (optionally squircle) bounds, before its own background and
     /// children paint. Pair with a translucent background for frosted glass.

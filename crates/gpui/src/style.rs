@@ -292,6 +292,10 @@ pub struct Style {
     /// flatten the corner curvature into a "squircle". 2.0 or below is circular.
     pub corner_smoothing: f32,
 
+    /// Whether the overflow mask clips to this element's rounded corners
+    /// (macOS only; other platforms clip to the rectangle).
+    pub rounded_clip: bool,
+
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
@@ -695,7 +699,34 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                if self.rounded_clip {
+                    let outer = self
+                        .corner_radii
+                        .to_pixels(rem_size)
+                        .clamp_radii_for_quad_size(bounds.size);
+                    let left = min.x - bounds.origin.x;
+                    let top = min.y - bounds.origin.y;
+                    let right = bounds.bottom_right().x - max.x;
+                    let bottom = bounds.bottom_right().y - max.y;
+                    let inset = |radius: Pixels, a: Pixels, b: Pixels| {
+                        (radius - a.max(b)).max(Pixels::ZERO)
+                    };
+                    let radii = Corners {
+                        top_left: inset(outer.top_left, left, top),
+                        top_right: inset(outer.top_right, right, top),
+                        bottom_right: inset(outer.bottom_right, right, bottom),
+                        bottom_left: inset(outer.bottom_left, left, bottom),
+                    };
+                    let mut mask = ContentMask::rounded(
+                        Bounds::from_corners(min, max),
+                        radii,
+                        self.corner_smoothing,
+                    );
+                    mask.bounds = bounds;
+                    return Some(mask);
+                }
+
+                Some(ContentMask::new(bounds))
             }
         }
     }
@@ -848,6 +879,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             corner_smoothing: 0.0,
+            rounded_clip: false,
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,

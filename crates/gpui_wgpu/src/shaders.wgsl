@@ -111,6 +111,16 @@ struct Corners {
     bottom_left: f32,
 }
 
+// Mirrors gpui::ContentMask. Rounded clipping (rounded_bounds/corner_radii) is
+// only implemented on macOS; here the mask clips to `bounds`.
+struct ContentMask {
+    bounds: Bounds,
+    rounded_bounds: Bounds,
+    corner_radii: Corners,
+    corner_smoothing: f32,
+    pad: f32,
+}
+
 struct Edges {
     top: f32,
     right: f32,
@@ -642,7 +652,7 @@ struct Quad {
     order: u32,
     border_style: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     background: Background,
     border_color: Hsla,
     corner_radii: Corners,
@@ -682,7 +692,7 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color1 = gradient.color1;
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
     return out;
 }
 
@@ -1103,7 +1113,7 @@ struct Shadow {
     // The shadow rect for drop shadows; the "hole" rect for inset shadows.
     bounds: Bounds,
     corner_radii: Corners,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     // Only consulted when `inset == 1u`: the element's own bounds, used as a rounded-rect
     // clip so the shadow never escapes the element.
@@ -1143,7 +1153,7 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     out.position = to_device_position(unit_vertex, geometry);
     out.color = hsla_to_rgba(shadow.color);
     out.shadow_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask.bounds);
     return out;
 }
 
@@ -1304,7 +1314,7 @@ struct Underline {
     order: u32,
     pad: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     thickness: f32,
     wavy: u32,
@@ -1328,7 +1338,7 @@ fn vs_underline(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) 
     out.position = to_device_position(unit_vertex, underline.bounds);
     out.color = hsla_to_rgba(underline.color);
     out.underline_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, underline.bounds, underline.content_mask.bounds);
     return out;
 }
 
@@ -1370,7 +1380,7 @@ struct MonochromeSprite {
     order: u32,
     pad: u32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     color: Hsla,
     tile: AtlasTile,
     transformation: TransformationMatrix,
@@ -1394,7 +1404,7 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
-    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transformation);
     return out;
 }
 
@@ -1419,7 +1429,7 @@ struct PolychromeSprite {
     grayscale: u32,
     opacity: f32,
     bounds: Bounds,
-    content_mask: Bounds,
+    content_mask: ContentMask,
     corner_radii: Corners,
     tile: AtlasTile,
     // Bicubic sampling and squircle clip are Metal-only; ignored here.
@@ -1444,7 +1454,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     out.position = to_device_position(unit_vertex, sprite.bounds);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.sprite_id = instance_id;
-    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask.bounds);
     return out;
 }
 

@@ -1095,6 +1095,9 @@ impl ScaleTransform {
     pub fn apply_content_mask(&self, mask: ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.apply_bounds(mask.bounds),
+            rounded_bounds: self.apply_bounds(mask.rounded_bounds),
+            corner_radii: self.apply_corners(mask.corner_radii),
+            ..mask
         }
     }
 
@@ -1233,6 +1236,7 @@ mod tests {
                     height: ScaledPixels(1000.0),
                 },
             },
+            ..Default::default()
         };
         scene.insert_primitive(Quad {
             bounds: quad_bounds,
