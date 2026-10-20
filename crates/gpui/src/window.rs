@@ -4854,16 +4854,34 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+        self.paint_rounded_surface(bounds, image_buffer, Corners::default(), 0.0);
+    }
+
+    /// Paint a surface clipped to rounded corners, antialiased like a quad
+    /// with the same `corner_radii` and `corner_smoothing`.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_rounded_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CVPixelBuffer,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
+        let scale_factor = self.scale_factor();
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: corner_radii.scale(scale_factor),
+            corner_smoothing,
             image_buffer,
         });
     }
@@ -4911,6 +4929,8 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: Corners::default(),
+            corner_smoothing: 0.0,
             external_texture,
         });
     }

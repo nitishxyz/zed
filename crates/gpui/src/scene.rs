@@ -846,6 +846,10 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    /// Corners the surface is clipped to (macOS), with the same continuous
+    /// smoothing as quads and sprites.
+    pub corner_radii: Corners<ScaledPixels>,
+    pub corner_smoothing: f32,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(target_os = "linux")]
@@ -1177,6 +1181,7 @@ impl ScaleTransform {
             Primitive::Surface(surface) => {
                 surface.bounds = self.apply_bounds(surface.bounds);
                 surface.content_mask = self.apply_content_mask(surface.content_mask);
+                surface.corner_radii = self.apply_corners(surface.corner_radii);
             }
             Primitive::BackdropBlur(blur) => {
                 blur.bounds = self.apply_bounds(blur.bounds);
