@@ -5472,6 +5472,12 @@ impl Window {
                 self.mouse_within_window = true;
                 PlatformInput::Pinch(pinch)
             }
+            PlatformInput::SmartMagnify(magnify) => {
+                self.mouse_position = magnify.position;
+                self.modifiers = magnify.modifiers;
+                self.mouse_within_window = true;
+                PlatformInput::SmartMagnify(magnify)
+            }
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {

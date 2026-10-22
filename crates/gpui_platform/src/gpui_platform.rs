@@ -53,6 +53,10 @@ pub fn web_init() {
     gpui_web::init_logging();
 }
 
+/// Whether two-finger horizontal scrolls should navigate back and forward.
+#[cfg(target_os = "macos")]
+pub use gpui_macos::swipe_navigation_enabled;
+
 /// Returns the default [`Platform`] for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     #[cfg(target_os = "macos")]

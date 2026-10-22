@@ -2,7 +2,7 @@ use gpui::{
     Capslock, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     NavigationDirection, PinchEvent, Pixels, PlatformInput, PressureStage, ScrollDelta,
-    ScrollWheelEvent, TouchPhase, point, px,
+    ScrollWheelEvent, SmartMagnifyEvent, TouchPhase, point, px,
 };
 
 use crate::{
@@ -15,7 +15,7 @@ use cocoa::{
 };
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
-use objc::{msg_send, sel, sel_impl};
+use objc::{class, msg_send, runtime::BOOL, sel, sel_impl};
 use std::{borrow::Cow, ffi::c_void};
 
 const BACKSPACE_KEY: u16 = 0x7f;
@@ -101,6 +101,15 @@ unsafe fn read_modifiers(native_event: id) -> Modifiers {
     }
 }
 
+/// Whether the user lets two-finger horizontal scrolls navigate pages
+/// ("Swipe between pages" in Trackpad settings).
+pub fn swipe_navigation_enabled() -> bool {
+    unsafe {
+        let enabled: BOOL = msg_send![class!(NSEvent), isSwipeTrackingFromScrollEventsEnabled];
+        enabled == YES
+    }
+}
+
 pub(crate) unsafe fn platform_input_from_native(
     native_event: id,
     window_height: Option<Pixels>,
@@ -111,7 +120,19 @@ pub(crate) unsafe fn platform_input_from_native(
         // Filter out event types that aren't in the NSEventType enum.
         // See https://github.com/servo/cocoa-rs/issues/155#issuecomment-323482792 for details.
         match event_type as u64 {
-            0 | 21 | 32 | 33 | 35 | 36 | 37 => {
+            // NSEventTypeSmartMagnify
+            32 => {
+                return window_height.map(|window_height| {
+                    PlatformInput::SmartMagnify(SmartMagnifyEvent {
+                        position: point(
+                            px(native_event.locationInWindow().x as f32),
+                            window_height - px(native_event.locationInWindow().y as f32),
+                        ),
+                        modifiers: read_modifiers(native_event),
+                    })
+                });
+            }
+            0 | 21 | 33 | 35 | 36 | 37 => {
                 return None;
             }
             _ => {}
@@ -240,6 +261,7 @@ pub(crate) unsafe fn platform_input_from_native(
                         TouchPhase::Started
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 
@@ -261,6 +283,7 @@ pub(crate) unsafe fn platform_input_from_native(
                         TouchPhase::Started
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 

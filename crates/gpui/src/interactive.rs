@@ -592,6 +592,26 @@ impl Deref for PinchEvent {
     }
 }
 
+/// A smart magnify gesture from the platform (a two-finger double tap on a
+/// macOS trackpad), asking to toggle zoom at `position`.
+#[derive(Clone, Debug, Default)]
+pub struct SmartMagnifyEvent {
+    /// The position of the gesture on the window.
+    pub position: Point<Pixels>,
+
+    /// The modifiers that were held down during the gesture.
+    pub modifiers: Modifiers,
+}
+
+impl Sealed for SmartMagnifyEvent {}
+impl InputEvent for SmartMagnifyEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::SmartMagnify(self)
+    }
+}
+impl GestureEvent for SmartMagnifyEvent {}
+impl MouseEvent for SmartMagnifyEvent {}
+
 impl ScrollDelta {
     /// Returns true if this is a precise scroll delta in pixels.
     pub fn precise(&self) -> bool {
@@ -871,6 +891,8 @@ pub enum PlatformInput {
     ScrollWheel(ScrollWheelEvent),
     /// A pinch gesture was performed.
     Pinch(PinchEvent),
+    /// A smart magnify gesture was performed.
+    SmartMagnify(SmartMagnifyEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
     /// A raw touch event on a touch screen.
@@ -890,6 +912,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
             PlatformInput::Pinch(event) => Some(event),
+            PlatformInput::SmartMagnify(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
             PlatformInput::Touch(_) => None,
         }
@@ -907,6 +930,7 @@ impl PlatformInput {
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
             PlatformInput::Pinch(_) => None,
+            PlatformInput::SmartMagnify(_) => None,
             PlatformInput::FileDrop(_) => None,
             PlatformInput::Touch(_) => None,
         }

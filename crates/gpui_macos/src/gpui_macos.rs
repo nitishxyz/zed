@@ -51,6 +51,7 @@ pub(crate) use window::*;
 #[cfg(feature = "font-kit")]
 pub(crate) use text_system::*;
 
+pub use events::swipe_navigation_enabled;
 pub use platform::MacPlatform;
 
 trait BoolExt {

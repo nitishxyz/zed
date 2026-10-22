@@ -193,6 +193,10 @@ unsafe fn build_classes() {
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
             decl.add_method(
+                sel!(smartMagnifyWithEvent:),
+                handle_view_event as extern "C" fn(&Object, Sel, id),
+            );
+            decl.add_method(
                 sel!(mouseDragged:),
                 handle_view_event as extern "C" fn(&Object, Sel, id),
             );
@@ -2422,6 +2426,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 | PlatformInput::MouseExited(_)
                 | PlatformInput::ScrollWheel(_)
                 | PlatformInput::Pinch(_)
+                | PlatformInput::SmartMagnify(_)
         ) {
             lock.cursor_visible.store(true, Ordering::Relaxed);
         }
