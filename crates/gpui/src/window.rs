@@ -3020,9 +3020,12 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
+        // The rectangle snaps out to device pixels; a rounded mask keeps its
+        // rounding (the shaders clip to it), scaled like the rest of the scene.
+        let mask = self.content_mask();
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
-            ..Default::default()
+            bounds: self.cover_bounds(mask.bounds),
+            ..mask.scale(self.scale_factor())
         }
     }
 
