@@ -585,6 +585,13 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                                       shadow.element_corner_radii,
                                       shadow.corner_smoothing);
     alpha *= saturate(0.5 - element_distance);
+  } else {
+    // A drop shadow is not painted under its element (as in CSS), so it does
+    // not show through a translucent fill. The antialiased edge keeps it.
+    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                      shadow.element_corner_radii,
+                                      shadow.corner_smoothing);
+    alpha *= 1. - saturate(-0.5 - element_distance);
   }
 
   return apply_content_mask(input.color * float4(1., 1., 1., alpha), shadow.content_mask, input.position.xy);
@@ -1581,7 +1588,12 @@ fragment BackdropCompositeFragmentOutput backdrop_composite_fragment(
     texture2d<float> blurred [[texture(0)]]) {
   float distance = quad_sdf(input.position.xy, blur->bounds, blur->corner_radii,
                             blur->corner_smoothing);
-  float alpha = saturate(0.5 - distance);
+  // Shape coverage, the rounded part of the content mask (its rectangle is
+  // clipped by clip distances) and the element opacity, which fades the
+  // blurred backdrop in over the sharp one.
+  float alpha = saturate(0.5 - distance) *
+                content_mask_coverage(blur->content_mask, input.position.xy) *
+                blur->opacity;
   if (alpha <= 0.) {
     discard_fragment();
   }

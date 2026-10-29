@@ -2058,3 +2058,221 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Hsla, Quad, hsla};
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(w), ScaledPixels(h)),
+        }
+    }
+
+    fn mask(bounds: Bounds<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds,
+            ..Default::default()
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, color: Hsla) -> Quad {
+        Quad {
+            bounds,
+            content_mask: mask(rect(0., 0., 4096., 4096.)),
+            background: color.into(),
+            ..Default::default()
+        }
+    }
+
+    fn blur(bounds: Bounds<ScaledPixels>, radius: f32, opacity: f32) -> BackdropBlur {
+        BackdropBlur {
+            order: 0,
+            blur_radius: ScaledPixels(radius),
+            bounds,
+            content_mask: mask(rect(0., 0., 4096., 4096.)),
+            corner_radii: Corners::default(),
+            corner_smoothing: 0.,
+            saturation: 1.,
+            opacity,
+        }
+    }
+
+    /// Black left half, white right half, then `blurs`.
+    fn edge_scene(blurs: &[BackdropBlur]) -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 32., 64.), hsla(0., 0., 0., 1.)));
+        scene.insert_primitive(quad(rect(32., 0., 32., 64.), hsla(0., 0., 1., 1.)));
+        for b in blurs {
+            scene.insert_primitive(*b);
+        }
+        scene.finish();
+        scene
+    }
+
+    fn render(renderer: &mut MetalRenderer, scene: &Scene) -> RgbaImage {
+        renderer
+            .render_scene_to_image(scene, size(DevicePixels(64), DevicePixels(64)))
+            .unwrap()
+    }
+
+    #[test]
+    fn backdrop_blur_fades_in_with_its_opacity() {
+        let mut renderer = MetalRenderer::new_headless(Arc::default());
+        let at = |opacity: f32, renderer: &mut MetalRenderer| {
+            let image = render(
+                renderer,
+                &edge_scene(&[blur(rect(0., 0., 64., 64.), 6., opacity)]),
+            );
+            f32::from(image.get_pixel(29, 32)[0])
+        };
+        let (sharp, half, full) = (
+            at(0., &mut renderer),
+            at(0.5, &mut renderer),
+            at(1., &mut renderer),
+        );
+        assert_eq!(sharp, 0., "opacity 0 leaves the region sharp");
+        assert!(full > 40., "the white half bleeds over the edge: {full}");
+        assert!(
+            (half - full / 2.).abs() <= 2.,
+            "half opacity is half way: {half} vs {full}"
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_keeps_to_a_rounded_content_mask() {
+        let mut renderer = MetalRenderer::new_headless(Arc::default());
+        let mut b = blur(rect(0., 0., 64., 64.), 6., 1.);
+        b.content_mask.rounded_bounds = rect(26., 0., 32., 64.);
+        b.content_mask.corner_radii = Corners::all(ScaledPixels(16.));
+        let image = render(&mut renderer, &edge_scene(&[b]));
+        assert_eq!(
+            image.get_pixel(33, 0)[0],
+            255,
+            "outside the rounded corner stays sharp"
+        );
+        assert!(image.get_pixel(33, 32)[0] < 255, "inside is blurred");
+    }
+
+    #[test]
+    fn a_drop_shadow_is_not_painted_under_its_element() {
+        let mut renderer = MetalRenderer::new_headless(Arc::default());
+        let element = rect(16., 16., 32., 32.);
+        let shadow = gpui::Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(4.),
+            bounds: rect(16., 20., 32., 32.),
+            corner_radii: Corners::default(),
+            content_mask: mask(rect(0., 0., 64., 64.)),
+            color: hsla(0., 0., 0., 1.),
+            element_bounds: element,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            corner_smoothing: 0.,
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0., 0., 64., 64.), hsla(0., 0., 1., 1.)));
+        scene.insert_primitive(shadow);
+        scene.finish();
+        let image = render(&mut renderer, &scene);
+        assert_eq!(
+            image.get_pixel(32, 32)[0],
+            255,
+            "no shadow under the element"
+        );
+        assert!(image.get_pixel(32, 50)[0] < 200, "shadow below it");
+    }
+
+    /// GPU time of a 3024x1964 frame of busy content with and without menu-
+    /// and palette-sized blurs. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn backdrop_blur_cost() {
+        let mut renderer = MetalRenderer::new_headless(Arc::default());
+        let (w, h) = (3024., 1964.);
+        let target = {
+            let d = metal::TextureDescriptor::new();
+            d.set_width(w as u64);
+            d.set_height(h as u64);
+            d.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            d.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+            d.set_storage_mode(metal::MTLStorageMode::Private);
+            renderer.device.new_texture(&d)
+        };
+        renderer.update_path_intermediate_textures(size(
+            DevicePixels(w as i32),
+            DevicePixels(h as i32),
+        ));
+        let content = |scene: &mut Scene| {
+            for i in 0..3000 {
+                let (x, y) = ((i % 60) as f32 * 50., (i / 60) as f32 * 39.);
+                scene.insert_primitive(quad(
+                    rect(x, y, 44., 30.),
+                    hsla((i % 7) as f32 / 7., 0.6, 0.5, 1.),
+                ));
+            }
+        };
+        let cases: [(&str, Vec<BackdropBlur>); 5] = [
+            ("none", vec![]),
+            (
+                "menu 440x560 r40",
+                vec![blur(rect(800., 400., 440., 560.), 40., 1.)],
+            ),
+            (
+                "palette 1160x900 r40",
+                vec![blur(rect(900., 200., 1160., 900.), 40., 1.)],
+            ),
+            (
+                "menu over dialog",
+                vec![
+                    blur(rect(700., 300., 1000., 800.), 40., 1.),
+                    blur(rect(900., 500., 440., 560.), 40., 1.),
+                ],
+            ),
+            (
+                "tooltip 160x50 r20",
+                vec![blur(rect(900., 500., 160., 50.), 20., 1.)],
+            ),
+        ];
+        for (name, blurs) in cases {
+            let mut scene = Scene::default();
+            content(&mut scene);
+            for b in &blurs {
+                let mut b = *b;
+                b.corner_radii = Corners::all(ScaledPixels(16.));
+                b.corner_smoothing = 4.;
+                scene.insert_primitive(b);
+                scene.insert_primitive(quad(b.bounds, hsla(0., 0., 0.1, 0.7)));
+            }
+            scene.finish();
+            let mut times = Vec::new();
+            for i in 0..300 {
+                let cb = renderer
+                    .render_frame(
+                        &scene,
+                        &target,
+                        size(DevicePixels(w as i32), DevicePixels(h as i32)),
+                    )
+                    .unwrap();
+                cb.commit();
+                cb.wait_until_completed();
+                let (start, end): (f64, f64) = unsafe {
+                    (
+                        msg_send![cb.as_ptr(), GPUStartTime],
+                        msg_send![cb.as_ptr(), GPUEndTime],
+                    )
+                };
+                if i >= 100 {
+                    times.push((end - start) * 1000.);
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            println!(
+                "{name}: min {:.3} ms, median {:.3} ms, p90 {:.3} ms",
+                times[0], times[100], times[180]
+            );
+        }
+    }
+}

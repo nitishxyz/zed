@@ -649,6 +649,9 @@ pub struct BackdropBlur {
     pub corner_smoothing: f32,
     /// Saturation multiplier applied to the blurred backdrop (1.0 = unchanged).
     pub saturation: f32,
+    /// How much the blurred backdrop replaces what is beneath (the element
+    /// opacity it was painted with): 0 leaves the region sharp, 1 replaces it.
+    pub opacity: f32,
 }
 
 impl BackdropBlur {
@@ -1255,6 +1258,7 @@ mod tests {
             corner_radii: Corners::default(),
             corner_smoothing: 0.0,
             saturation: 1.0,
+            opacity: 1.0,
         });
         scene.finish();
         assert!(scene.backdrop_blurs[0].order > scene.quads[0].order);

@@ -3882,7 +3882,8 @@ impl Window {
     /// (clipped to the rounded rect described by `corner_radii` and
     /// `corner_smoothing`) is blurred with a Gaussian of standard deviation
     /// `blur_radius` and multiplied in saturation by `saturation`. Paint the
-    /// element's own (typically translucent) background afterwards.
+    /// element's own (typically translucent) background afterwards. Under an
+    /// element opacity the blurred backdrop fades in over the sharp one.
     /// Renderers without backdrop support ignore this primitive.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -3895,7 +3896,8 @@ impl Window {
         saturation: f32,
     ) {
         self.invalidator.debug_assert_paint();
-        if blur_radius <= Pixels::ZERO && saturation == 1.0 {
+        let opacity = self.element_opacity();
+        if (blur_radius <= Pixels::ZERO && saturation == 1.0) || opacity <= 0.0 {
             return;
         }
         let scale_factor = self.scale_factor();
@@ -3907,6 +3909,7 @@ impl Window {
             corner_radii: corner_radii.scale(scale_factor),
             corner_smoothing,
             saturation,
+            opacity: opacity.min(1.0),
         });
     }
 

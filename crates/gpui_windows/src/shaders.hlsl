@@ -960,6 +960,12 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow is not painted under its element (as in CSS), so it does
+        // not show through a translucent fill. The antialiased edge keeps it.
+        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii);
+        alpha *= 1.0 - saturate(-0.5 - element_distance);
     }
 
     return input.color * float4(1., 1., 1., alpha);

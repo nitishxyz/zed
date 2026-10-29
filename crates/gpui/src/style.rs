@@ -755,13 +755,8 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_drop_shadows(
-            bounds,
-            corner_radii,
-            self.corner_smoothing,
-            &self.box_shadow,
-        );
-
+        // The blur samples what is beneath before the element's own shadow is
+        // painted, so the shadow does not bleed into the frosted region.
         if self.backdrop_blur.is_some() || self.backdrop_saturation.is_some() {
             window.paint_backdrop_blur(
                 bounds,
@@ -771,6 +766,13 @@ impl Style {
                 self.backdrop_saturation.unwrap_or(1.0),
             );
         }
+
+        window.paint_drop_shadows(
+            bounds,
+            corner_radii,
+            self.corner_smoothing,
+            &self.box_shadow,
+        );
 
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {

@@ -1204,6 +1204,13 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
                                         shadow.element_corner_radii,
                                         shadow.corner_smoothing);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow is not painted under its element (as in CSS), so it does
+        // not show through a translucent fill. The antialiased edge keeps it.
+        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                        shadow.element_corner_radii,
+                                        shadow.corner_smoothing);
+        alpha *= 1.0 - saturate(-0.5 - element_distance);
     }
 
     return blend_color(input.color, alpha);
