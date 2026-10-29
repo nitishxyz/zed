@@ -135,9 +135,6 @@ pub(crate) struct MetalRenderer {
     backdrop_composite_pipeline_state: metal::RenderPipelineState,
     /// Two half-resolution scratch textures used by backdrop blur passes.
     backdrop_scratch: Option<(metal::Texture, metal::Texture, Size<DevicePixels>)>,
-    /// Whether the layer currently vends drawables that can be sampled
-    /// (`framebufferOnly = false`), which backdrop blur requires.
-    layer_readable: bool,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -173,8 +170,10 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
-        #[cfg(any(test, feature = "test-support"))]
+        // Readable drawables: backdrop blur samples the frame, and visual
+        // tests read it back. Always on: toggled per frame, the drawables
+        // already pooled stayed framebuffer-only, so a newly shown blurred
+        // surface rendered unblurred for its first frames.
         layer.set_framebuffer_only(false);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
@@ -384,7 +383,6 @@ impl MetalRenderer {
             backdrop_pass_pipeline_state,
             backdrop_composite_pipeline_state,
             backdrop_scratch: None,
-            layer_readable: cfg!(any(test, feature = "test-support")),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -499,14 +497,6 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        // Backdrop blur samples the frame texture, which needs readable
-        // drawables. Only pay for that while blurs are on screen.
-        let needs_readable =
-            !scene.backdrop_blurs.is_empty() || cfg!(any(test, feature = "test-support"));
-        if needs_readable != self.layer_readable {
-            layer.set_framebuffer_only(!needs_readable);
-            self.layer_readable = needs_readable;
-        }
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
