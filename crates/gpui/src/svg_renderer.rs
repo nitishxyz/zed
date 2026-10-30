@@ -178,7 +178,6 @@ impl SvgRenderer {
     }
 
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
-    #[ztracing::instrument(skip_all)]
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
         usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
     }
@@ -187,7 +186,6 @@ impl SvgRenderer {
     ///
     /// `scale_factor` is multiplied by [`SMOOTH_SVG_SCALE_FACTOR`], matching
     /// [`SvgRenderer::render_single_frame`].
-    #[ztracing::instrument(skip_all)]
     pub fn render_parsed(
         &self,
         svg: &ParsedSvg,
