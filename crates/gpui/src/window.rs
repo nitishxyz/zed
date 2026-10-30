@@ -4289,12 +4289,17 @@ impl Window {
                 continue;
             }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
+            // As in CSS, a spread grows (or shrinks) the corners with the box, so a
+            // ring keeps its element's shape: a capsule's ring is a capsule.
+            let shadow_radii = corner_radii
+                .map(|r| (*r + shadow.spread_radius).max(Pixels::ZERO))
+                .clamp_radii_for_quad_size(shadow_bounds.size);
             self.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: corner_radii.scale(scale_factor),
+                corner_radii: shadow_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
